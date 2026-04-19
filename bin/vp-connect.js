@@ -6,6 +6,7 @@ const os   = require('os');
 const fs   = require('fs');
 const path = require('path');
 const cp   = require('child_process');
+const { Bonjour } = require('bonjour-service');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -139,6 +140,14 @@ function startServer() {
     socket.on('close', () => console.log('[conn] disconnected — waiting for phone…'));
     socket.on('error', e  => console.log('[warn] socket:', e.message));
   });
+
+  // Advertise via Bonjour/mDNS so the iOS app can find us automatically
+  const bonjour = new Bonjour();
+  const svc = bonjour.publish({ name: 'vp-connect', type: 'vp-connect', port: PORT });
+  svc.on('error', e => console.error('[mdns] advertise error:', e.message));
+  process.on('exit',    () => bonjour.destroy());
+  process.on('SIGINT',  () => { bonjour.destroy(); process.exit(0); });
+  process.on('SIGTERM', () => { bonjour.destroy(); process.exit(0); });
 
   server.on('error', err => {
     if (err.code === 'EADDRINUSE') {
