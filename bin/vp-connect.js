@@ -7,6 +7,7 @@ const fs   = require('fs');
 const path = require('path');
 const cp   = require('child_process');
 const { Bonjour } = require('bonjour-service');
+const qrcode = require('qrcode-terminal');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -37,6 +38,25 @@ function getLocalIP() {
     }
   }
   return '127.0.0.1';
+}
+
+/**
+ * Prints an ASCII QR code to stdout encoding a `vpconnect://HOST:PORT` URL.
+ * The iOS app scans this to pair without relying on Bonjour — bypasses flaky
+ * mDNS, AP isolation, and every other router-induced discovery failure.
+ *
+ * In-terminal only: no file saved to disk, no Preview auto-opened. If the
+ * user closes the terminal, they can re-print by running `npx vp-connect`
+ * (foreground) or `npx vp-connect --qr`.
+ */
+function printPairingQR(ip, port) {
+  const url = `vpconnect://${ip}:${port}`;
+  console.log('  Scan this QR from the Vibephone app → Connect:\n');
+  qrcode.generate(url, { small: true }, (qr) => {
+    // Indent each line so the QR sits under the host/port banner
+    console.log(qr.split('\n').map(l => '    ' + l).join('\n'));
+  });
+  console.log(`  (QR encodes: ${url})\n`);
 }
 
 function exec(cmd) {
@@ -274,9 +294,7 @@ function startServer() {
     console.log(`  IP       : ${ip}`);
     console.log(`  Port     : ${PORT}`);
     console.log(line);
-    console.log(`  Enter in the Vibephone app:`);
-    console.log(`    Host → ${ip}`);
-    console.log(`    Port → ${PORT}`);
+    printPairingQR(ip, PORT);
     console.log(line);
   });
 }
@@ -404,9 +422,25 @@ Start-ScheduledTask -TaskName '${TASK_NAME}'
     console.log(`  Stop  →  npx vp-connect --uninstall\n`);
   }
 
-  console.log(`  Enter in the Vibephone app:`);
-  console.log(`    Host → ${getLocalIP()}`);
-  console.log(`    Port → ${PORT}\n`);
+  printPairingQR(getLocalIP(), PORT);
+  console.log(`  (Reprint QR anytime with:  npx vp-connect --qr)\n`);
+}
+
+// ── QR (reprint on demand) ───────────────────────────────────────────────────
+
+/** Print the pairing QR to stdout without starting a server. Handy for
+ *  re-pairing a new phone without reinstalling the background service. */
+function printQROnly() {
+  const ip = getLocalIP();
+  const line = '─'.repeat(50);
+  console.log('');
+  console.log(line);
+  console.log('  vp-connect  |  Pair a phone');
+  console.log(line);
+  console.log(`  IP    : ${ip}`);
+  console.log(`  Port  : ${PORT}`);
+  console.log(line);
+  printPairingQR(ip, PORT);
 }
 
 // ── Uninstall ────────────────────────────────────────────────────────────────
@@ -473,4 +507,5 @@ const arg = process.argv[2];
 if      (arg === '--install')   install();
 else if (arg === '--uninstall') uninstall();
 else if (arg === '--verify')    verify();
+else if (arg === '--qr')        printQROnly();
 else                            startServer();

@@ -16,7 +16,7 @@ Paste this into your terminal — it installs and starts the server automaticall
 npx vp-connect --install
 ```
 
-The command prints your IP address and port. Enter those in the Vibephone app to connect.
+The command prints a **QR code** at the end. In the Vibephone app tap **Connect** and scan the QR — no typing required.
 
 > **macOS note:** The installer will prompt you to grant **Accessibility** permission the first time. This is required so `vp-connect` can paste what you dictate (Cmd+V). System Settings will open automatically — toggle ON the `node` entry. After granting it, run `npx vp-connect --verify` to confirm.
 
@@ -35,6 +35,14 @@ npx vp-connect --verify
 ```
 
 Reports whether macOS Accessibility permission is granted. If not, auto-opens the settings pane so you can fix it.
+
+## Re-show the pairing QR
+
+```bash
+npx vp-connect --qr
+```
+
+Prints the pairing QR without starting a server — useful when connecting a new phone while the background service is already running.
 
 ## Uninstall
 
