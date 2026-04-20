@@ -16,6 +16,11 @@ const WIN       = process.platform === 'win32';
 const LABEL     = 'com.vibephone.vp-connect';
 const TASK_NAME = 'vp-connect';
 
+// Privacy: dictated text can contain passwords, secrets, or private code.
+// By default we only log a summary (char + word count). Set VP_LOG_TEXT=1
+// to log the actual text (useful for debugging, risky for shared machines).
+const LOG_TEXT = process.env.VP_LOG_TEXT === '1';
+
 const INSTALL_DIR = MAC
   ? path.join(os.homedir(), '.vp-connect')
   : path.join(process.env.APPDATA || os.homedir(), 'vp-connect');
@@ -110,7 +115,10 @@ function handleMessage(msg) {
   if (type === 'text') {
     const text = String(msg.text || '').trim();
     if (!text) return;
-    console.log(`[text:${msg.mode || 'plain'} · ${currentPlatform}] ${JSON.stringify(text)}`);
+    const summary = LOG_TEXT
+      ? JSON.stringify(text)
+      : `${text.length} chars, ${text.split(/\s+/).filter(Boolean).length} words`;
+    console.log(`[text:${msg.mode || 'plain'} · ${currentPlatform}] ${summary}`);
     try { pasteText(text); }
     catch (e) { console.error('[warn] paste failed:', e.message); }
 

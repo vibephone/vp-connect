@@ -50,3 +50,4 @@ No Python, no dependencies — just Node.js built-ins.
 | Variable | Default | Description |
 |---|---|---|
 | `VP_PORT` | `38555` | TCP port to listen on |
+| `VP_LOG_TEXT` | _unset_ | Set to `1` to log dictated text verbatim. Default logs only a `N chars, M words` summary so passwords or private code don't land in `/tmp/vp-connect.log`. |
