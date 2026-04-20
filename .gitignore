@@ -1,1 +1,16 @@
 node_modules/
+
+# macOS
+.DS_Store
+
+# Logs (never commit runtime / debug logs — may contain dictated text or PII)
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.vp-connect*.log
+
+# Local scratch
+*.tmp
+/tmp/
