@@ -18,6 +18,8 @@ npx vp-connect --install
 
 The command prints your IP address and port. Enter those in the Vibephone app to connect.
 
+> **macOS note:** The installer will prompt you to grant **Accessibility** permission the first time. This is required so `vp-connect` can paste what you dictate (Cmd+V). System Settings will open automatically — toggle ON the `node` entry. After granting it, run `npx vp-connect --verify` to confirm.
+
 ## Run manually (foreground)
 
 If you just want to try it without installing:
@@ -25,6 +27,14 @@ If you just want to try it without installing:
 ```bash
 npx vp-connect
 ```
+
+## Verify setup (macOS Accessibility check)
+
+```bash
+npx vp-connect --verify
+```
+
+Reports whether macOS Accessibility permission is granted. If not, auto-opens the settings pane so you can fix it.
 
 ## Uninstall
 
