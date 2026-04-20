@@ -208,6 +208,26 @@ function install() {
   fs.copyFileSync(__filename, INSTALLED_BIN);
   console.log(`  ✓ Script saved to  ${INSTALLED_BIN}`);
 
+  // Install runtime deps into INSTALL_DIR so the LaunchAgent can resolve them
+  // independently of the npx cache (which may be cleaned between runs).
+  const deps = (require('../package.json') || {}).dependencies || {};
+  fs.writeFileSync(
+    path.join(INSTALL_DIR, 'package.json'),
+    JSON.stringify({ name: 'vp-connect-install', private: true, dependencies: deps }, null, 2)
+  );
+  try {
+    cp.execSync('npm install --no-audit --no-fund --silent', {
+      cwd: INSTALL_DIR,
+      stdio: 'inherit',
+    });
+    console.log(`  ✓ Dependencies installed in ${INSTALL_DIR}`);
+  } catch (e) {
+    console.error('  ✗ Failed to install dependencies:', e.message);
+    console.error('    The service will crash on launch. Install deps manually:');
+    console.error(`      cd ${INSTALL_DIR} && npm install`);
+    process.exit(1);
+  }
+
   const nodeBin = process.execPath;
 
   if (MAC) {
