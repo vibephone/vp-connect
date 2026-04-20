@@ -1,6 +1,6 @@
 {
   "name": "vp-connect",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Vibephone server — lets your iPhone control Claude Code (or any IDE) on Mac/Windows via TCP",
   "bin": {
     "vp-connect": "bin/vp-connect.js"
@@ -11,6 +11,14 @@
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["vibephone", "claude-code", "voice", "tcp", "dictation", "bonjour", "mdns"],
+  "keywords": [
+    "vibephone",
+    "claude-code",
+    "voice",
+    "tcp",
+    "dictation",
+    "bonjour",
+    "mdns"
+  ],
   "license": "MIT"
 }
