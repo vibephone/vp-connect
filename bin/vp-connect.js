@@ -96,20 +96,34 @@ Add-Type -AssemblyName System.Windows.Forms
 
 // ── Message handler ──────────────────────────────────────────────────────────
 
+// Last platform the phone told us it is targeting. Currently informational —
+// future versions will use this to pick a per-platform keymap.
+let currentPlatform = 'cursor';
+
 function handleMessage(msg) {
   const type = String(msg.type || '');
+
+  // Every message may carry a `platform` stamp; keep it fresh for future
+  // per-platform keymap routing.
+  if (msg.platform) currentPlatform = String(msg.platform);
 
   if (type === 'text') {
     const text = String(msg.text || '').trim();
     if (!text) return;
-    console.log(`[text:${msg.mode || 'plain'}] ${JSON.stringify(text)}`);
+    console.log(`[text:${msg.mode || 'plain'} · ${currentPlatform}] ${JSON.stringify(text)}`);
     try { pasteText(text); }
     catch (e) { console.error('[warn] paste failed:', e.message); }
 
   } else if (type === 'enter' || type === 'esc' || type === 'run') {
-    console.log(`[${type}]`);
+    console.log(`[${type} · ${currentPlatform}]`);
     try { pressKey(type); }
     catch (e) { console.error(`[warn] key (${type}) failed:`, e.message); }
+
+  } else if (type === 'platform') {
+    // Phone announced a platform switch (or its initial platform on connect).
+    // No keymap routing yet, but acknowledge it so we don't spam warnings.
+    currentPlatform = String(msg.value || currentPlatform);
+    console.log(`[platform] ${currentPlatform}`);
 
   } else {
     console.log('[warn] unknown message type:', JSON.stringify(msg));
