@@ -50,7 +50,7 @@ function getLocalIP() {
  */
 function printPairingQR(ip, port) {
   const url = `vpconnect://${ip}:${port}`;
-  console.log('  Scan this QR from the Vibephone app → Connect:\n');
+  console.log('  Scan this QR from the Vibr app → Connect:\n');
   qrcode.generate(url, { small: true }, (qr) => {
     // Indent each line so the QR sits under the host/port banner
     console.log(qr.split('\n').map(l => '    ' + l).join('\n'));
@@ -137,13 +137,56 @@ function macDialog(title, message) {
 
 /**
  * Paste text into the focused application.
- * Mac : copies via pbcopy (handles all Unicode), pastes with Cmd+V via osascript.
- * Win : writes to a temp file, loads into clipboard via PowerShell, then Ctrl+V via SendKeys.
+ *
+ *   Mac : copies via pbcopy (handles all Unicode), pastes with ⌘V via
+ *         osascript.
+ *
+ *         For Cursor specifically we *conditionally* prepend ⌘L (Cursor's
+ *         "toggle chat panel" shortcut). The catch is that ⌘L really is a
+ *         toggle — if chat is open AND focused, ⌘L closes it, the paste
+ *         then lands in the code editor, and the autoSend Return adds a
+ *         newline to the user's source file. Disastrous.
+ *
+ *         Heuristic to avoid that: only send ⌘L when Cursor is NOT the
+ *         frontmost app. The reasoning:
+ *           - Cursor in background → user is in browser/Slack/email and
+ *             dictating to Cursor remotely. ⌘L brings Cursor forward and
+ *             focuses chat. Original benefit preserved.
+ *           - Cursor already frontmost → user just looked away from chat
+ *             to grab the phone. ⌘L would be a coin flip (focuses chat
+ *             if editor was active, closes chat if chat was active).
+ *             Skipping ⌘L means the paste lands wherever they last
+ *             clicked — almost always the chat input since that's what
+ *             they were typing into a moment ago.
+ *
+ *         The frontmost-check + focus + paste happens in a single
+ *         osascript invocation so we only pay for one process spawn.
+ *
+ *         Claude Code (terminal-based) and chat-web (no universal
+ *         shortcut) don't get auto-focus at all; they rely on the user
+ *         clicking the target themselves.
+ *
+ *   Win : writes to a temp file, loads into clipboard via PowerShell,
+ *         then Ctrl+V via SendKeys.
  */
 function pasteText(text) {
   if (MAC) {
     cp.execFileSync('pbcopy', [], { input: text });
-    exec(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`);
+    if (currentPlatform === 'cursor') {
+      exec(
+        `osascript ` +
+        `-e 'tell application "System Events"' ` +
+        `-e   'set frontApp to name of first process whose frontmost is true' ` +
+        `-e   'if frontApp is not "Cursor" then' ` +
+        `-e     'keystroke "l" using command down' ` +
+        `-e     'delay 0.05' ` +
+        `-e   'end if' ` +
+        `-e   'keystroke "v" using command down' ` +
+        `-e 'end tell'`
+      );
+    } else {
+      exec(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`);
+    }
 
   } else if (WIN) {
     // Write to temp file to avoid any quoting issues
@@ -161,35 +204,57 @@ Add-Type -AssemblyName System.Windows.Forms
 }
 
 /**
- * Trigger a named action (enter / esc / allow / interrupt).
+ * Trigger a named action (enter / run / esc / allow / interrupt / clearInput).
  * Mac : osascript key codes — no Accessibility permission needed for most key events.
  * Win : PowerShell SendKeys.
  *
- * `run` is kept as a **silent alias for `enter`** for backward compatibility
- * with older iOS clients. It used to map to ⌘↵ / ⌃↵, but that proved to be
- * either a duplicate of Enter (Cursor), broken (Claude Code — terminals
- * intercept ⌘↵ to toggle fullscreen), or wrong (web chat apps treat ⌘↵ as
- * a newline). Aliasing to Enter is the safe behaviour on every platform.
+ * `enter` = plain ↵. Submits in most chat apps and terminals.
+ * `run`   = ⌘↵ (Mac) / Ctrl+↵ (Win). Submits in multi-line text fields where
+ *           plain ↵ inserts a newline (Slack, ChatGPT web, Google Docs
+ *           comments, etc.). Warning: in terminal-based UIs (Terminal.app,
+ *           iTerm, Warp running Claude Code), ⌘↵ toggles full-screen — so
+ *           use `enter` there, not `run`.
+ * `allow` = Ctrl+↵. Cursor "allow action" / Claude Code tool-use approval.
+ * `interrupt` = Ctrl+C. Stops the agent or sends SIGINT in a shell.
+ * `clearInput` = ⌘A then Delete (Mac) / Ctrl+A then Delete (Win). Select all
+ *           text in the focused field and wipe it — the Mac equivalent of the
+ *           phone's "start over" button.
  */
 function pressKey(action) {
-  // Back-compat: older phones still send {"type":"run"} expecting ⌘↵.
-  // Route it through the plain Enter path so it's always the submit action.
-  if (action === 'run') action = 'enter';
-
   if (MAC) {
+    if (action === 'clearInput') {
+      if (currentPlatform === 'claude-code') {
+        // Ctrl+U = readline "kill to beginning of line" — clears the whole
+        // terminal input without affecting anything else on screen.
+        exec(`osascript -e 'tell application "System Events" to keystroke "u" using control down'`);
+      } else {
+        // ⌘A + Delete — select all text in the focused field then wipe it.
+        exec(`osascript -e 'tell application "System Events" to keystroke "a" using command down'`);
+        exec(`osascript -e 'tell application "System Events" to key code 51'`);
+      }
+      return;
+    }
     const scripts = {
       enter     : `osascript -e 'tell application "System Events" to key code 36'`,
+      run       : `osascript -e 'tell application "System Events" to keystroke return using command down'`,
       esc       : `osascript -e 'tell application "System Events" to key code 53'`,
-      // Cursor "allow action" / Claude Code tool-use approval.
       allow     : `osascript -e 'tell application "System Events" to keystroke return using control down'`,
-      // Terminal-style interrupt: stops the agent or sends SIGINT in a shell.
       interrupt : `osascript -e 'tell application "System Events" to keystroke "c" using control down'`,
     };
     if (scripts[action]) exec(scripts[action]);
 
   } else if (WIN) {
+    if (action === 'clearInput') {
+      runPS(`
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.SendKeys]::SendWait('^a')
+Start-Sleep -Milliseconds 20
+[System.Windows.Forms.SendKeys]::SendWait('{DELETE}')
+`);
+      return;
+    }
     const keys = {
-      enter: '{ENTER}', esc: '{ESC}',
+      enter: '{ENTER}', run: '^{ENTER}', esc: '{ESC}',
       allow: '^{ENTER}', interrupt: '^c',
     };
     if (keys[action]) runPS(`
@@ -246,8 +311,49 @@ const SCROLL_HELPER_JS = `
 ObjC.import('CoreGraphics')
 ObjC.import('Foundation')
 
+// System Events lets us ask the OS for the frontmost app's main window frame,
+// which we use to route scroll events at the transcript area rather than at
+// wherever the user's mouse cursor happens to sit. This keeps the Mac's
+// pointer exactly where it is (including inside the chat typebox) while the
+// scroll still lands on the scrollable content above — resolving the
+// "pointer in typebox blocks trackpad" usability issue.
+const SE = Application('System Events')
+
 const stdin = $.NSFileHandle.fileHandleWithStandardInput
 let buffer = ''
+
+// Cached scroll target in global display coords (points, origin top-left).
+// null → fall back to the current cursor location (pre-1.5 behaviour).
+let target = null
+let lastTickMs = 0
+const BURST_GAP_MS = 300          // Refresh cache if a new scroll burst starts.
+const MAX_TARGET_AGE_MS = 1500    // Force refresh during a long sustained scroll.
+let targetFetchedMs = 0
+
+function nowMs() {
+  return $.NSDate.date.timeIntervalSince1970 * 1000
+}
+
+function refreshTarget() {
+  try {
+    const front = SE.processes.whose({ frontmost: true })[0]
+    if (!front) { target = null; return }
+    const wins = front.windows
+    if (!wins || wins.length < 1) { target = null; return }
+    const w = wins[0]
+    const p = w.position()
+    const s = w.size()
+    if (!p || !s) { target = null; return }
+    const x = p[0], y = p[1], W = s[0], H = s[1]
+    if (W < 100 || H < 100) { target = null; return }
+    // Aim at the upper-middle of the window — almost always inside the
+    // transcript / editor pane, never inside the bottom-docked typebox.
+    target = { x: x + W * 0.5, y: y + H * 0.30 }
+    targetFetchedMs = nowMs()
+  } catch (e) {
+    target = null
+  }
+}
 
 function handleLine(line) {
   const parts = line.split(',')
@@ -255,6 +361,17 @@ function handleLine(line) {
   const dx = parseInt(parts[0], 10) | 0
   const dy = parseInt(parts[1], 10) | 0
   if (!dx && !dy) return
+
+  const t = nowMs()
+  // Refresh the target at the start of each scroll burst or whenever the
+  // cache is too old, so app switches mid-session are picked up.
+  if (target === null
+      || (t - lastTickMs) > BURST_GAP_MS
+      || (t - targetFetchedMs) > MAX_TARGET_AGE_MS) {
+    refreshTarget()
+  }
+  lastTickMs = t
+
   // CGEventCreateScrollWheelEvent(source, units, wheelCount, wheel1, wheel2)
   //   units: 0 = pixel, 1 = line
   //   wheel1 = vertical   (positive scrolls content down / reveals earlier content)
@@ -262,9 +379,20 @@ function handleLine(line) {
   // The Mac applies the user's natural-scroll setting on top for us.
   const evt = $.CGEventCreateScrollWheelEvent($(), 0, 2, dy, dx)
   if (!evt) return
-  // kCGHIDEventTap = 0
+  // Stamp the event with an explicit target point when we have one. This
+  // routes the scroll to that coordinate without moving the real mouse
+  // cursor. kCGHIDEventTap = 0.
+  if (target) {
+    $.CGEventSetLocation(evt, { x: target.x, y: target.y })
+  }
   $.CGEventPost(0, evt)
 }
+
+// Prime the target cache BEFORE the first line arrives so that the very
+// first flick of a session doesn't pay the ~50-100 ms System Events lookup
+// cost as visible scroll lag. Subsequent flicks within MAX_TARGET_AGE_MS
+// reuse this cache for free.
+refreshTarget()
 
 while (true) {
   const data = stdin.availableData
@@ -438,7 +566,7 @@ function handleMessage(msg) {
     catch (e) { handleKeystrokeError(e, 'paste'); }
 
   } else if (type === 'enter' || type === 'esc' || type === 'run'
-          || type === 'allow' || type === 'interrupt') {
+          || type === 'allow' || type === 'interrupt' || type === 'clearInput') {
     console.log(`[${type} · ${currentPlatform}]`);
     try { pressKey(type); }
     catch (e) { handleKeystrokeError(e, `key (${type})`); }
@@ -510,7 +638,11 @@ function startServer() {
 
   // ── TCP server ─────────────────────────────────────────────────────────────
   const server = net.createServer(socket => {
+    // Match the phone: disable Nagle so each scrollDelta / keystroke frame
+    // is flushed immediately instead of waiting ~40 ms for coalescing.
+    socket.setNoDelay(true);
     console.log(`\n[conn] connected: ${socket.remoteAddress}`);
+
     let buf = '';
 
     socket.on('data', chunk => {
@@ -547,7 +679,7 @@ function startServer() {
   server.listen(PORT, '0.0.0.0', () => {
     const line = '─'.repeat(50);
     console.log(line);
-    console.log('  vp-connect  |  Vibephone server');
+    console.log('  vp-connect  |  Vibr server');
     console.log(line);
     console.log(`  Platform : ${process.platform}`);
     console.log(`  IP       : ${currentIP}`);
