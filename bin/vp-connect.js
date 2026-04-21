@@ -497,7 +497,7 @@ function startServer() {
     if (bonjourInst)  { try { bonjourInst.destroy(); } catch {} bonjourInst = null; }
 
     bonjourInst = new Bonjour();
-    console.log('[mdns] waiting 5s before advertising to let stale records expire…');
+    console.log('[mdns] waiting 60s before advertising to let stale mDNS records fully expire…');
     bonjourTimer = setTimeout(() => {
       try {
         const svc = bonjourInst.publish({ name: 'vp-connect', type: 'vp-connect', port: PORT });
@@ -506,7 +506,7 @@ function startServer() {
       } catch (e) {
         console.log('[mdns] could not advertise:', e.message);
       }
-    }, 5000);
+    }, 60_000);
   }
 
   function stopBonjour() {
