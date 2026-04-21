@@ -267,9 +267,16 @@ function startServer() {
   });
 
   // Advertise via Bonjour/mDNS so the iOS app can find us automatically
+  // Delay publish by 5s to let any stale mDNS records from a previous run expire,
+  // which prevents macOS from incrementing the LocalHostName on restart.
   const bonjour = new Bonjour();
-  const svc = bonjour.publish({ name: 'vp-connect', type: 'vp-connect', port: PORT });
-  svc.on('error', e => console.error('[mdns] advertise error:', e.message));
+  let svc;
+  console.log('[mdns] waiting 5s before advertising to let stale records expire…');
+  setTimeout(() => {
+    svc = bonjour.publish({ name: 'vp-connect', type: 'vp-connect', port: PORT });
+    svc.on('error', e => console.error('[mdns] advertise error:', e.message));
+    console.log('[mdns] now advertising via Bonjour — QR code ready to scan');
+  }, 5000);
   process.on('exit',    () => bonjour.destroy());
   process.on('SIGINT',  () => { bonjour.destroy(); process.exit(0); });
   process.on('SIGTERM', () => { bonjour.destroy(); process.exit(0); });
