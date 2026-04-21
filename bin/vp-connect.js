@@ -244,8 +244,59 @@ function handleMessage(msg) {
 // ── TCP server ───────────────────────────────────────────────────────────────
 
 function startServer() {
-  const ip = getLocalIP();
+  let currentIP = getLocalIP();
 
+  // ── Bonjour lifecycle ──────────────────────────────────────────────────────
+  let bonjourInst = null;
+  let bonjourTimer = null;
+
+  function startBonjour() {
+    if (bonjourTimer) { clearTimeout(bonjourTimer); bonjourTimer = null; }
+    if (bonjourInst)  { try { bonjourInst.destroy(); } catch {} bonjourInst = null; }
+
+    bonjourInst = new Bonjour();
+    console.log('[mdns] waiting 5s before advertising to let stale records expire…');
+    bonjourTimer = setTimeout(() => {
+      try {
+        const svc = bonjourInst.publish({ name: 'vp-connect', type: 'vp-connect', port: PORT });
+        svc.on('error', e => console.error('[mdns] advertise error:', e.message));
+        console.log('[mdns] now advertising via Bonjour — QR code ready to scan');
+      } catch (e) {
+        console.log('[mdns] could not advertise:', e.message);
+      }
+    }, 5000);
+  }
+
+  function stopBonjour() {
+    if (bonjourTimer) { clearTimeout(bonjourTimer); bonjourTimer = null; }
+    if (bonjourInst)  { try { bonjourInst.destroy(); } catch {} bonjourInst = null; }
+  }
+
+  // ── Network monitor ────────────────────────────────────────────────────────
+  // Polls every 5s to detect IP changes (WiFi switch) or loss (airplane mode).
+  function startNetworkMonitor() {
+    return setInterval(() => {
+      const newIP = getLocalIP();
+      if (newIP === currentIP) return;
+
+      if (newIP === '127.0.0.1') {
+        console.log('[net] network lost — Bonjour paused; QR code unavailable until reconnected');
+        stopBonjour();
+      } else {
+        const wasOffline = currentIP === '127.0.0.1';
+        console.log(wasOffline
+          ? `[net] network restored — new IP: ${newIP}`
+          : `[net] IP changed: ${currentIP} → ${newIP}`
+        );
+        printPairingQR(newIP, PORT);
+        stopBonjour();
+        startBonjour();
+      }
+      currentIP = newIP;
+    }, 5000);
+  }
+
+  // ── TCP server ─────────────────────────────────────────────────────────────
   const server = net.createServer(socket => {
     console.log(`\n[conn] connected: ${socket.remoteAddress}`);
     let buf = '';
@@ -266,21 +317,6 @@ function startServer() {
     socket.on('error', e  => console.log('[warn] socket:', e.message));
   });
 
-  // Advertise via Bonjour/mDNS so the iOS app can find us automatically
-  // Delay publish by 5s to let any stale mDNS records from a previous run expire,
-  // which prevents macOS from incrementing the LocalHostName on restart.
-  const bonjour = new Bonjour();
-  let svc;
-  console.log('[mdns] waiting 5s before advertising to let stale records expire…');
-  setTimeout(() => {
-    svc = bonjour.publish({ name: 'vp-connect', type: 'vp-connect', port: PORT });
-    svc.on('error', e => console.error('[mdns] advertise error:', e.message));
-    console.log('[mdns] now advertising via Bonjour — QR code ready to scan');
-  }, 5000);
-  process.on('exit',    () => bonjour.destroy());
-  process.on('SIGINT',  () => { bonjour.destroy(); process.exit(0); });
-  process.on('SIGTERM', () => { bonjour.destroy(); process.exit(0); });
-
   server.on('error', err => {
     if (err.code === 'EADDRINUSE') {
       console.error(`\n[error] Port ${PORT} is already in use.`);
@@ -298,12 +334,26 @@ function startServer() {
     console.log('  vp-connect  |  Vibephone server');
     console.log(line);
     console.log(`  Platform : ${process.platform}`);
-    console.log(`  IP       : ${ip}`);
+    console.log(`  IP       : ${currentIP}`);
     console.log(`  Port     : ${PORT}`);
     console.log(line);
-    printPairingQR(ip, PORT);
-    console.log(line);
+
+    if (currentIP === '127.0.0.1') {
+      console.log('  [net] no network detected — QR code will appear once connected');
+      console.log(line);
+    } else {
+      printPairingQR(currentIP, PORT);
+      console.log(line);
+      startBonjour();
+    }
+
+    startNetworkMonitor();
   });
+
+  const cleanup = () => { stopBonjour(); process.exit(0); };
+  process.on('exit',    () => stopBonjour());
+  process.on('SIGINT',  cleanup);
+  process.on('SIGTERM', cleanup);
 }
 
 // ── Install as background service ────────────────────────────────────────────
