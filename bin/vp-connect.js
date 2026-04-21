@@ -6,7 +6,6 @@ const os   = require('os');
 const fs   = require('fs');
 const path = require('path');
 const cp   = require('child_process');
-const { Bonjour } = require('bonjour-service');
 const qrcode = require('qrcode-terminal');
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -488,32 +487,6 @@ function handleMessage(msg) {
 function startServer() {
   let currentIP = getLocalIP();
 
-  // ── Bonjour lifecycle ──────────────────────────────────────────────────────
-  let bonjourInst = null;
-  let bonjourTimer = null;
-
-  function startBonjour() {
-    if (bonjourTimer) { clearTimeout(bonjourTimer); bonjourTimer = null; }
-    if (bonjourInst)  { try { bonjourInst.destroy(); } catch {} bonjourInst = null; }
-
-    bonjourInst = new Bonjour();
-    console.log('[mdns] waiting 60s before advertising to let stale mDNS records fully expire…');
-    bonjourTimer = setTimeout(() => {
-      try {
-        const svc = bonjourInst.publish({ name: 'vp-connect', type: 'vp-connect', port: PORT });
-        svc.on('error', e => console.error('[mdns] advertise error:', e.message));
-        console.log('[mdns] now advertising via Bonjour — QR code ready to scan');
-      } catch (e) {
-        console.log('[mdns] could not advertise:', e.message);
-      }
-    }, 60_000);
-  }
-
-  function stopBonjour() {
-    if (bonjourTimer) { clearTimeout(bonjourTimer); bonjourTimer = null; }
-    if (bonjourInst)  { try { bonjourInst.destroy(); } catch {} bonjourInst = null; }
-  }
-
   // ── Network monitor ────────────────────────────────────────────────────────
   // Polls every 5s to detect IP changes (WiFi switch) or loss (airplane mode).
   function startNetworkMonitor() {
@@ -522,8 +495,7 @@ function startServer() {
       if (newIP === currentIP) return;
 
       if (newIP === '127.0.0.1') {
-        console.log('[net] network lost — Bonjour paused; QR code unavailable until reconnected');
-        stopBonjour();
+        console.log('[net] network lost — QR code unavailable until reconnected');
       } else {
         const wasOffline = currentIP === '127.0.0.1';
         console.log(wasOffline
@@ -531,8 +503,6 @@ function startServer() {
           : `[net] IP changed: ${currentIP} → ${newIP}`
         );
         printPairingQR(newIP, PORT);
-        stopBonjour();
-        startBonjour();
       }
       currentIP = newIP;
     }, 5000);
@@ -590,15 +560,14 @@ function startServer() {
     } else {
       printPairingQR(currentIP, PORT);
       console.log(line);
-      startBonjour();
     }
 
     startNetworkMonitor();
     startScrollHelper();
   });
 
-  const cleanup = () => { stopBonjour(); stopScrollHelper(); process.exit(0); };
-  process.on('exit',    () => { stopBonjour(); stopScrollHelper(); });
+  const cleanup = () => { stopScrollHelper(); process.exit(0); };
+  process.on('exit',    () => { stopScrollHelper(); });
   process.on('SIGINT',  cleanup);
   process.on('SIGTERM', cleanup);
 }
