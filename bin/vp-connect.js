@@ -169,19 +169,201 @@ Add-Type -AssemblyName System.Windows.Forms
 function pressKey(action) {
   if (MAC) {
     const scripts = {
-      enter : `osascript -e 'tell application "System Events" to key code 36'`,
-      esc   : `osascript -e 'tell application "System Events" to key code 53'`,
-      run   : `osascript -e 'tell application "System Events" to keystroke return using command down'`,
+      enter     : `osascript -e 'tell application "System Events" to key code 36'`,
+      esc       : `osascript -e 'tell application "System Events" to key code 53'`,
+      run       : `osascript -e 'tell application "System Events" to keystroke return using command down'`,
+      // Cursor "allow action" / Claude Code tool-use approval.
+      allow     : `osascript -e 'tell application "System Events" to keystroke return using control down'`,
+      // Terminal-style interrupt: stops the agent or sends SIGINT in a shell.
+      interrupt : `osascript -e 'tell application "System Events" to keystroke "c" using control down'`,
     };
     if (scripts[action]) exec(scripts[action]);
 
   } else if (WIN) {
-    const keys = { enter: '{ENTER}', esc: '{ESC}', run: '^{ENTER}' };
+    const keys = {
+      enter: '{ENTER}', esc: '{ESC}', run: '^{ENTER}',
+      allow: '^{ENTER}', interrupt: '^c',
+    };
     if (keys[action]) runPS(`
 Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.SendKeys]::SendWait('${keys[action]}')
 `);
   }
+}
+
+/**
+ * Fire a single arrow-key press for scroll. Used by the phone's scroll pad,
+ * which can send up to ~18 ticks/second — so we deliberately dispatch
+ * asynchronously (fire-and-forget) to avoid blocking the socket reader
+ * while osascript / PowerShell spins up.
+ *
+ * Arrow keys are the universally-safe choice here: they work in terminals,
+ * browsers, Cursor, and Claude Code's TUI, and they never steal keyboard
+ * focus from whatever the user is currently typing into.
+ */
+function scrollTick(direction) {
+  if (MAC) {
+    // key codes: up=126, down=125, left=123, right=124
+    const codes = { up: 126, down: 125, left: 123, right: 124 };
+    const code = codes[direction];
+    if (code === undefined) return;
+    cp.exec(`osascript -e 'tell application "System Events" to key code ${code}'`, (err) => {
+      if (err) handleKeystrokeError(err, `scroll ${direction}`);
+    });
+
+  } else if (WIN) {
+    const keys = { up: '{UP}', down: '{DOWN}', left: '{LEFT}', right: '{RIGHT}' };
+    const k = keys[direction];
+    if (!k) return;
+    const script = `
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.SendKeys]::SendWait('${k}')
+`;
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    cp.exec(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, (err) => {
+      if (err) handleKeystrokeError(err, `scroll ${direction}`);
+    });
+  }
+}
+
+// ── Pixel-smooth scroll helper (macOS) ───────────────────────────────────────
+
+// Tiny JXA (JavaScript-for-Automation) program run via `osascript -l JavaScript`
+// that reads lines of "dx,dy\n" from stdin and posts real CGScrollWheel events.
+// This is how we get Mac-trackpad-quality smooth scrolling: arrow keys jump a
+// whole line at a time, but CGScrollWheel accepts sub-pixel precision and the
+// target apps interpret it as a real trackpad gesture (including natural-scroll
+// direction and smooth inertia rendering on their side).
+const SCROLL_HELPER_JS = `
+ObjC.import('CoreGraphics')
+ObjC.import('Foundation')
+
+const stdin = $.NSFileHandle.fileHandleWithStandardInput
+let buffer = ''
+
+function handleLine(line) {
+  const parts = line.split(',')
+  if (parts.length < 2) return
+  const dx = parseInt(parts[0], 10) | 0
+  const dy = parseInt(parts[1], 10) | 0
+  if (!dx && !dy) return
+  // CGEventCreateScrollWheelEvent(source, units, wheelCount, wheel1, wheel2)
+  //   units: 0 = pixel, 1 = line
+  //   wheel1 = vertical   (positive scrolls content down / reveals earlier content)
+  //   wheel2 = horizontal (positive scrolls content right / reveals earlier content)
+  // The Mac applies the user's natural-scroll setting on top for us.
+  const evt = $.CGEventCreateScrollWheelEvent($(), 0, 2, dy, dx)
+  if (!evt) return
+  // kCGHIDEventTap = 0
+  $.CGEventPost(0, evt)
+}
+
+while (true) {
+  const data = stdin.availableData
+  if (!data || data.length === 0) break
+  const s = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding)
+  const chunk = ObjC.unwrap(s)
+  if (!chunk) continue
+  buffer += chunk
+  let nl
+  while ((nl = buffer.indexOf('\\n')) !== -1) {
+    const line = buffer.slice(0, nl).trim()
+    buffer = buffer.slice(nl + 1)
+    if (line) {
+      try { handleLine(line) } catch (e) { /* ignore malformed lines */ }
+    }
+  }
+}
+`;
+
+const SCROLL_HELPER_PATH = path.join(INSTALL_DIR, 'scroll-helper.js');
+let scrollHelper = null;          // spawned child_process or null
+let scrollHelperFailed = false;   // true once we've given up on restarting
+
+function ensureScrollHelperSource() {
+  try {
+    fs.mkdirSync(INSTALL_DIR, { recursive: true });
+    if (!fs.existsSync(SCROLL_HELPER_PATH) ||
+        fs.readFileSync(SCROLL_HELPER_PATH, 'utf8') !== SCROLL_HELPER_JS) {
+      fs.writeFileSync(SCROLL_HELPER_PATH, SCROLL_HELPER_JS);
+    }
+  } catch (e) {
+    console.log('[scroll-helper] cannot write helper script:', e.message);
+    throw e;
+  }
+}
+
+function startScrollHelper() {
+  if (!MAC || scrollHelperFailed || scrollHelper) return;
+  try {
+    ensureScrollHelperSource();
+    scrollHelper = cp.spawn('osascript', ['-l', 'JavaScript', SCROLL_HELPER_PATH], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+    scrollHelper.on('exit', (code, signal) => {
+      console.log(`[scroll-helper] exited code=${code} signal=${signal || ''}`);
+      scrollHelper = null;
+      // If it died abnormally, retry once after a short delay; give up if
+      // it keeps dying (probably means JXA can't run on this box).
+      if (!scrollHelperFailed) setTimeout(() => {
+        if (!scrollHelper) startScrollHelper();
+      }, 2000);
+    });
+    scrollHelper.on('error', (e) => {
+      console.log('[scroll-helper] spawn error:', e.message);
+      scrollHelperFailed = true;
+      scrollHelper = null;
+    });
+    scrollHelper.stderr.on('data', (chunk) => {
+      const msg = chunk.toString().trim();
+      if (msg) console.log('[scroll-helper stderr]', msg);
+    });
+    console.log('[scroll-helper] started (pixel-smooth scrolling active)');
+  } catch (e) {
+    scrollHelperFailed = true;
+    scrollHelper = null;
+  }
+}
+
+function stopScrollHelper() {
+  if (!scrollHelper) return;
+  try { scrollHelper.stdin.end(); } catch {}
+  try { scrollHelper.kill(); } catch {}
+  scrollHelper = null;
+}
+
+/** Fire-and-forget pixel-scroll. Returns false if the helper isn't running
+ *  so the caller can fall back to arrow keys. */
+function sendScrollPixel(dx, dy) {
+  if (!MAC) return false;
+  if (!scrollHelper || !scrollHelper.stdin.writable) return false;
+  try {
+    scrollHelper.stdin.write(`${dx},${dy}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Aggregate pixel scroll logs into bursts the same way we do for arrow keys.
+const pixelBurst = { sumX: 0, sumY: 0, count: 0, timer: null };
+function logScrollPixel(dx, dy) {
+  pixelBurst.sumX += dx;
+  pixelBurst.sumY += dy;
+  pixelBurst.count += 1;
+  if (pixelBurst.timer) clearTimeout(pixelBurst.timer);
+  pixelBurst.timer = setTimeout(flushPixelBurst, 400);
+}
+function flushPixelBurst() {
+  if (pixelBurst.count > 0) {
+    console.log(
+      `[scroll px · ${currentPlatform}] Δx=${pixelBurst.sumX} Δy=${pixelBurst.sumY} (${pixelBurst.count} ticks)`
+    );
+  }
+  pixelBurst.sumX = 0;
+  pixelBurst.sumY = 0;
+  pixelBurst.count = 0;
+  if (pixelBurst.timer) { clearTimeout(pixelBurst.timer); pixelBurst.timer = null; }
 }
 
 // ── Message handler ──────────────────────────────────────────────────────────
@@ -193,6 +375,28 @@ let currentPlatform = 'cursor';
 // Track accessibility-permission warnings so we only surface them to the
 // user once per service lifetime (avoid notification spam on every paste).
 let notifiedAccessibility = false;
+
+// Coalesce consecutive scroll ticks so we log one line per "burst" instead
+// of a line per tick (the phone's scroll pad fires up to ~18 ticks/sec).
+const scrollBurst = { dir: null, count: 0, timer: null };
+function logScrollTick(direction) {
+  if (scrollBurst.dir !== direction) {
+    flushScrollBurst();
+    scrollBurst.dir = direction;
+    scrollBurst.count = 0;
+  }
+  scrollBurst.count += 1;
+  if (scrollBurst.timer) clearTimeout(scrollBurst.timer);
+  scrollBurst.timer = setTimeout(flushScrollBurst, 400);
+}
+function flushScrollBurst() {
+  if (scrollBurst.dir && scrollBurst.count > 0) {
+    console.log(`[scroll ${scrollBurst.dir} · ${currentPlatform}] x${scrollBurst.count}`);
+  }
+  scrollBurst.dir = null;
+  scrollBurst.count = 0;
+  if (scrollBurst.timer) { clearTimeout(scrollBurst.timer); scrollBurst.timer = null; }
+}
 
 function handleKeystrokeError(e, context) {
   const msg = String(e.stderr || e.message || '');
@@ -225,10 +429,39 @@ function handleMessage(msg) {
     try { pasteText(text); }
     catch (e) { handleKeystrokeError(e, 'paste'); }
 
-  } else if (type === 'enter' || type === 'esc' || type === 'run') {
+  } else if (type === 'enter' || type === 'esc' || type === 'run'
+          || type === 'allow' || type === 'interrupt') {
     console.log(`[${type} · ${currentPlatform}]`);
     try { pressKey(type); }
     catch (e) { handleKeystrokeError(e, `key (${type})`); }
+
+  } else if (type === 'scroll') {
+    const dir = String(msg.direction || '');
+    if (dir !== 'up' && dir !== 'down' && dir !== 'left' && dir !== 'right') {
+      console.log('[warn] invalid scroll direction:', JSON.stringify(msg));
+      return;
+    }
+    logScrollTick(dir);
+    try { scrollTick(dir); }
+    catch (e) { handleKeystrokeError(e, `scroll (${dir})`); }
+
+  } else if (type === 'scrollDelta') {
+    // Pixel-smooth scroll from the iPhone trackpad. dx/dy are already signed
+    // per Apple's CGScrollWheel convention so we pass them straight through.
+    const dx = (parseInt(msg.dx, 10) || 0) | 0;
+    const dy = (parseInt(msg.dy, 10) || 0) | 0;
+    if (!dx && !dy) return;
+    logScrollPixel(dx, dy);
+    if (!sendScrollPixel(dx, dy)) {
+      // Helper not running — fall back to a single arrow-key tick in the
+      // dominant direction so scrolling still happens, just choppily.
+      const absX = Math.abs(dx), absY = Math.abs(dy);
+      if (absY >= absX) {
+        scrollTick(dy > 0 ? 'up' : 'down');
+      } else {
+        scrollTick(dx > 0 ? 'left' : 'right');
+      }
+    }
 
   } else if (type === 'platform') {
     // Phone announced a platform switch (or its initial platform on connect).
@@ -313,7 +546,11 @@ function startServer() {
       }
     });
 
-    socket.on('close', () => console.log('[conn] disconnected — waiting for phone…'));
+    socket.on('close', () => {
+      flushScrollBurst();
+      flushPixelBurst();
+      console.log('[conn] disconnected — waiting for phone…');
+    });
     socket.on('error', e  => console.log('[warn] socket:', e.message));
   });
 
@@ -348,10 +585,11 @@ function startServer() {
     }
 
     startNetworkMonitor();
+    startScrollHelper();
   });
 
-  const cleanup = () => { stopBonjour(); process.exit(0); };
-  process.on('exit',    () => stopBonjour());
+  const cleanup = () => { stopBonjour(); stopScrollHelper(); process.exit(0); };
+  process.on('exit',    () => { stopBonjour(); stopScrollHelper(); });
   process.on('SIGINT',  cleanup);
   process.on('SIGTERM', cleanup);
 }

@@ -60,6 +60,9 @@ npx vp-connect --uninstall
 | ENTER | Sends the Enter key |
 | ESC | Sends the Escape key |
 | RUN | Sends ⌘↵ (Mac) or Ctrl+↵ (Windows) |
+| ALLOW | Sends Ctrl+↵ — accepts Cursor's "allow action" prompt and Claude Code tool-use confirmations |
+| STOP | Sends Ctrl+C — interrupts a running agent or terminal command |
+| Trackpad   | macOS: pixel-smooth Core Graphics scroll-wheel events (honours your natural-scroll setting, supports momentum/flicks). Windows / fallback: arrow-key ticks (↑ ↓ ← →). Either way it never steals typing focus. |
 
 No Python, no dependencies — just Node.js built-ins.
 
