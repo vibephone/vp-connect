@@ -162,16 +162,25 @@ Add-Type -AssemblyName System.Windows.Forms
 }
 
 /**
- * Trigger a named action (enter / esc / run).
+ * Trigger a named action (enter / esc / allow / interrupt).
  * Mac : osascript key codes — no Accessibility permission needed for most key events.
  * Win : PowerShell SendKeys.
+ *
+ * `run` is kept as a **silent alias for `enter`** for backward compatibility
+ * with older iOS clients. It used to map to ⌘↵ / ⌃↵, but that proved to be
+ * either a duplicate of Enter (Cursor), broken (Claude Code — terminals
+ * intercept ⌘↵ to toggle fullscreen), or wrong (web chat apps treat ⌘↵ as
+ * a newline). Aliasing to Enter is the safe behaviour on every platform.
  */
 function pressKey(action) {
+  // Back-compat: older phones still send {"type":"run"} expecting ⌘↵.
+  // Route it through the plain Enter path so it's always the submit action.
+  if (action === 'run') action = 'enter';
+
   if (MAC) {
     const scripts = {
       enter     : `osascript -e 'tell application "System Events" to key code 36'`,
       esc       : `osascript -e 'tell application "System Events" to key code 53'`,
-      run       : `osascript -e 'tell application "System Events" to keystroke return using command down'`,
       // Cursor "allow action" / Claude Code tool-use approval.
       allow     : `osascript -e 'tell application "System Events" to keystroke return using control down'`,
       // Terminal-style interrupt: stops the agent or sends SIGINT in a shell.
@@ -181,7 +190,7 @@ function pressKey(action) {
 
   } else if (WIN) {
     const keys = {
-      enter: '{ENTER}', esc: '{ESC}', run: '^{ENTER}',
+      enter: '{ENTER}', esc: '{ESC}',
       allow: '^{ENTER}', interrupt: '^c',
     };
     if (keys[action]) runPS(`
