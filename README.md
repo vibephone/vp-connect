@@ -1,6 +1,6 @@
 # vp-connect
 
-Mac & Windows server for the [Vibr](https://github.com/dawa12k/vibephone) iOS app.  
+Mac & Windows server for the Vibr iOS app.  
 Lets you dictate voice commands from your iPhone directly into Claude Code (or any IDE).
 
 ## Requirements
@@ -63,13 +63,6 @@ npx vp-connect --uninstall
 | ESC | Sends the Escape key |
 | ALLOW | Sends Ctrl+↵ — accepts Cursor's "allow action" prompt and Claude Code tool-use confirmations |
 | STOP | Sends Ctrl+C — interrupts a running agent or terminal command |
-| Trackpad   | macOS: pixel-smooth Core Graphics scroll-wheel events (honours your natural-scroll setting, supports momentum/flicks). Scrolls are routed to the **transcript area of the frontmost window** via `CGEventSetLocation`, so they work even when your Mac's mouse cursor is parked inside the chat typebox — the cursor never moves. Windows / fallback: arrow-key ticks (↑ ↓ ← →). Either way it never steals typing focus. |
+| Trackpad   | macOS: pixel-smooth Core Graphics scroll-wheel events (honours your natural-scroll setting, supports momentum/flicks). Scrolls are routed to **wherever your Mac's mouse cursor is parked** via `CGEventSetLocation`, so hover over the pane you want to scroll and the phone trackpad just drives it — no focus stealing, no cursor jump. Windows / fallback: arrow-key ticks (↑ ↓ ← →). |
 
 No Python, no dependencies — just Node.js built-ins.
-
-## Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `VP_PORT` | `38555` | TCP port to listen on |
-| `VP_LOG_TEXT` | _unset_ | Set to `1` to log dictated text verbatim. Default logs only a `N chars, M words` summary so passwords or private code don't land in `/tmp/vp-connect.log`. |
