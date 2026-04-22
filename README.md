@@ -1,6 +1,6 @@
 # vp-connect
 
-Mac & Windows server for the [Vibephone](https://github.com/vibephone/vibephone) iOS app.  
+Mac & Windows server for the [Vibr](https://github.com/dawa12k/vibephone) iOS app.  
 Lets you dictate voice commands from your iPhone directly into Claude Code (or any IDE).
 
 ## Requirements
@@ -16,7 +16,7 @@ Paste this into your terminal — it installs and starts the server automaticall
 npx vp-connect --install
 ```
 
-The command prints a **QR code** at the end. In the Vibephone app tap **Connect** and scan the QR — no typing required.
+The command prints a **QR code** at the end. In the Vibr app tap **Connect** and scan the QR — no typing required.
 
 > **macOS note:** The installer will prompt you to grant **Accessibility** permission the first time. This is required so `vp-connect` can paste what you dictate (Cmd+V). System Settings will open automatically — toggle ON the `node` entry. After granting it, run `npx vp-connect --verify` to confirm.
 
@@ -52,16 +52,18 @@ npx vp-connect --uninstall
 
 ## How it works
 
-`vp-connect` opens a TCP socket on port `38555`. The Vibephone iOS app connects over your local Wi-Fi and sends JSON commands:
+`vp-connect` opens a TCP socket on port `38555`. The Vibr iOS app connects over your local Wi-Fi and sends JSON commands:
 
 | Command | What happens |
 |---|---|
 | Hold + speak | Text is pasted into your focused app |
-| ENTER | Sends the Enter key |
+| ENTER | Sends plain ↵. Submits in terminals, Cursor chat, Claude Code TUI, and single-line fields. |
+| RUN | Sends ⌘↵ (Mac) / Ctrl+↵ (Windows). Submits in multi-line fields where plain ↵ inserts a newline — Slack, ChatGPT web, Google Docs comments, etc. Avoid in terminal-based Claude Code (⌘↵ toggles Terminal/iTerm fullscreen). |
+| CLEAR | Clears the phone draft AND wipes the focused text field on your Mac/PC (⌘A ⌫ / Ctrl+A Del) — quickest way to "start over" when the dictation went sideways. |
 | ESC | Sends the Escape key |
 | ALLOW | Sends Ctrl+↵ — accepts Cursor's "allow action" prompt and Claude Code tool-use confirmations |
 | STOP | Sends Ctrl+C — interrupts a running agent or terminal command |
-| Trackpad   | macOS: pixel-smooth Core Graphics scroll-wheel events (honours your natural-scroll setting, supports momentum/flicks). Windows / fallback: arrow-key ticks (↑ ↓ ← →). Either way it never steals typing focus. |
+| Trackpad   | macOS: pixel-smooth Core Graphics scroll-wheel events (honours your natural-scroll setting, supports momentum/flicks). Scrolls are routed to the **transcript area of the frontmost window** via `CGEventSetLocation`, so they work even when your Mac's mouse cursor is parked inside the chat typebox — the cursor never moves. Windows / fallback: arrow-key ticks (↑ ↓ ← →). Either way it never steals typing focus. |
 
 No Python, no dependencies — just Node.js built-ins.
 

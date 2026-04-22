@@ -1,7 +1,7 @@
 {
   "name": "vp-connect",
-  "version": "1.4.0",
-  "description": "Vibephone server — lets your iPhone control Claude Code (or any IDE) on Mac/Windows via TCP",
+  "version": "1.6.4",
+  "description": "Vibr server — lets your iPhone control Claude Code (or any IDE) on Mac/Windows via TCP",
   "bin": {
     "vp-connect": "bin/vp-connect.js"
   },
@@ -13,7 +13,7 @@
     "node": ">=18"
   },
   "keywords": [
-    "vibephone",
+    "vibr",
     "claude-code",
     "voice",
     "tcp",

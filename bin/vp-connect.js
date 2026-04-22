@@ -330,28 +330,86 @@ const BURST_GAP_MS = 300          // Refresh cache if a new scroll burst starts.
 const MAX_TARGET_AGE_MS = 1500    // Force refresh during a long sustained scroll.
 let targetFetchedMs = 0
 
+// Cached frontmost-window frame + app name. Querying System Events costs
+// ~30-100 ms per call which would tank scroll responsiveness if we did it
+// per-tick, so we refresh only at burst boundaries. Mouse position, by
+// contrast, is cheap (~microseconds via CGEventCreate) so we sample it
+// fresh on every tick inside handleLine — this lets the scroll target
+// follow the mouse in real time as the user hovers over different panes.
+let cachedFrame = null   // { app, wx, wy, wW, wH }
+
 function nowMs() {
   return $.NSDate.date.timeIntervalSince1970 * 1000
 }
 
-function refreshTarget() {
+// Read the current mouse position in global display coordinates. Returns
+// null on failure. We use this as the preferred Cursor scroll target: macOS
+// natively routes scroll events to whatever scroll view the mouse is over,
+// so if the user hovers over the agent chat (as the phone's in-app hint
+// suggests), scrolls hit the agent without any heuristics on our side.
+function currentMouseLocation() {
+  try {
+    const evt = $.CGEventCreate($())
+    if (!evt) return null
+    const loc = $.CGEventGetLocation(evt)
+    return { x: loc.x, y: loc.y }
+  } catch (e) {
+    return null
+  }
+}
+
+// Compute the per-tick scroll target. Cheap — runs on every tick — so
+// it tracks live mouse movement in real time.
+//
+// We route scrolls to wherever the user is hovering: the mouse position
+// IS the target. Two reasons this is the right behaviour for every
+// platform Vibephone drives:
+//
+//   1. It respects user intent. Hovering over the agent chat scrolls the
+//      chat; hovering over the file editor (or a web page, or a terminal
+//      split) scrolls that. No heuristics that can mis-route.
+//   2. It works for apps whose internals we can't introspect (Electron
+//      hides its web content from AX, browsers expose only the outer
+//      chrome, terminals often lie about scroll areas). Mouse hover is
+//      universally unambiguous.
+//
+// We return null whenever the mouse isn't over a meaningful target
+// (no frontmost window, or mouse is outside that window). null means
+// we skip CGEventSetLocation, so the scroll event falls through to
+// the OS default — the actual mouse location. If the user stashed the
+// mouse somewhere unscrollable, nothing happens, which is a clear
+// signal to move the mouse back over the thing they want to scroll.
+function computeTarget() {
+  const m = currentMouseLocation()
+  if (!m) return null
+  const f = cachedFrame
+  if (!f) return null
+  const MARGIN = 4
+  const inside =
+    m.x >= f.wx + MARGIN && m.x <= f.wx + f.wW - MARGIN &&
+    m.y >= f.wy + MARGIN && m.y <= f.wy + f.wH - MARGIN
+  return inside ? { x: m.x, y: m.y } : null
+}
+
+// Refresh the cached frontmost-window frame. Called at burst boundaries
+// only, since System Events queries are expensive. Per-tick logic reads
+// cachedFrame + fresh mouse position to compute the final target.
+function refreshFrame() {
   try {
     const front = SE.processes.whose({ frontmost: true })[0]
-    if (!front) { target = null; return }
+    if (!front) { cachedFrame = null; return }
     const wins = front.windows
-    if (!wins || wins.length < 1) { target = null; return }
+    if (!wins || wins.length < 1) { cachedFrame = null; return }
     const w = wins[0]
     const p = w.position()
     const s = w.size()
-    if (!p || !s) { target = null; return }
-    const x = p[0], y = p[1], W = s[0], H = s[1]
-    if (W < 100 || H < 100) { target = null; return }
-    // Aim at the upper-middle of the window — almost always inside the
-    // transcript / editor pane, never inside the bottom-docked typebox.
-    target = { x: x + W * 0.5, y: y + H * 0.30 }
+    if (!p || !s) { cachedFrame = null; return }
+    const wx = p[0], wy = p[1], wW = s[0], wH = s[1]
+    if (wW < 100 || wH < 100) { cachedFrame = null; return }
+    cachedFrame = { app: front.name(), wx, wy, wW, wH }
     targetFetchedMs = nowMs()
   } catch (e) {
-    target = null
+    cachedFrame = null
   }
 }
 
@@ -363,14 +421,17 @@ function handleLine(line) {
   if (!dx && !dy) return
 
   const t = nowMs()
-  // Refresh the target at the start of each scroll burst or whenever the
-  // cache is too old, so app switches mid-session are picked up.
-  if (target === null
+  // Refresh the cached window frame at burst boundaries only (expensive
+  // System Events query). The mouse-position component of the target is
+  // re-read in computeTarget() on every tick.
+  if (cachedFrame === null
       || (t - lastTickMs) > BURST_GAP_MS
       || (t - targetFetchedMs) > MAX_TARGET_AGE_MS) {
-    refreshTarget()
+    refreshFrame()
   }
   lastTickMs = t
+
+  target = computeTarget()
 
   // CGEventCreateScrollWheelEvent(source, units, wheelCount, wheel1, wheel2)
   //   units: 0 = pixel, 1 = line
@@ -388,11 +449,10 @@ function handleLine(line) {
   $.CGEventPost(0, evt)
 }
 
-// Prime the target cache BEFORE the first line arrives so that the very
-// first flick of a session doesn't pay the ~50-100 ms System Events lookup
-// cost as visible scroll lag. Subsequent flicks within MAX_TARGET_AGE_MS
-// reuse this cache for free.
-refreshTarget()
+// Prime the frame cache BEFORE the first line arrives so the very first
+// flick of a session doesn't pay the ~50-100 ms System Events lookup as
+// visible scroll lag. Mouse position is always fresh (cheap to query).
+refreshFrame()
 
 while (true) {
   const data = stdin.availableData
