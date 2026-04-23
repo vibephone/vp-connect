@@ -1,6 +1,6 @@
 {
   "name": "vp-connect",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "description": "Vibr server — lets your iPhone control Claude Code (or any IDE) on Mac/Windows via TCP",
   "bin": {
     "vp-connect": "bin/vp-connect.js"

@@ -136,35 +136,63 @@ function macDialog(title, message) {
 // ── Keyboard ─────────────────────────────────────────────────────────────────
 
 /**
+ * macOS virtual key codes (CGKeyCode) and CGEventFlagMask_* values. These
+ * are what we feed to the scroll-helper's "K:code,flags" protocol, which
+ * posts the resulting keystroke via CGEventPost.
+ *
+ * Going through CGEventPost (rather than `tell application "System Events"
+ * to keystroke …`) is the whole reason dictated text actually lands on
+ * the Mac: the Apple Events path requires a second TCC permission
+ * (Automation → System Events) that LaunchAgents cannot surface a prompt
+ * for, so it silently 503's forever. CGEventPost piggybacks on the same
+ * Accessibility permission we already grant for the scroll pad.
+ */
+const MAC_KEY = {
+  v: 9, l: 37, a: 0, c: 8, u: 32,
+  period: 47,
+  return: 36, escape: 53, backspace: 51,
+  up: 126, down: 125, left: 123, right: 124,
+};
+const MAC_FLAG = {
+  SHIFT: 0x00020000,
+  CTRL:  0x00040000,
+  ALT:   0x00080000,
+  CMD:   0x00100000,
+};
+
+/**
+ * Fire a single key-down/key-up pair through the scroll helper.
+ * Fire-and-forget; returns false if the helper isn't running so the
+ * caller can skip / warn. Safe to call repeatedly for modifier
+ * combinations (e.g. ⌘A then Delete for clearInput).
+ */
+function sendKey(keyCode, flags = 0) {
+  if (!MAC) return false;
+  if (!scrollHelper || !scrollHelper.stdin.writable) return false;
+  try {
+    scrollHelper.stdin.write(`K:${keyCode | 0},${flags | 0}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Paste text into the focused application.
  *
- *   Mac : copies via pbcopy (handles all Unicode), pastes with ⌘V via
- *         osascript.
+ *   Mac : copies via pbcopy (handles all Unicode), pastes with ⌘V synthesised
+ *         through CGEventPost (via the scroll helper).
  *
- *         For Cursor specifically we *conditionally* prepend ⌘L (Cursor's
- *         "toggle chat panel" shortcut). The catch is that ⌘L really is a
- *         toggle — if chat is open AND focused, ⌘L closes it, the paste
- *         then lands in the code editor, and the autoSend Return adds a
- *         newline to the user's source file. Disastrous.
- *
- *         Heuristic to avoid that: only send ⌘L when Cursor is NOT the
- *         frontmost app. The reasoning:
- *           - Cursor in background → user is in browser/Slack/email and
- *             dictating to Cursor remotely. ⌘L brings Cursor forward and
- *             focuses chat. Original benefit preserved.
- *           - Cursor already frontmost → user just looked away from chat
- *             to grab the phone. ⌘L would be a coin flip (focuses chat
- *             if editor was active, closes chat if chat was active).
- *             Skipping ⌘L means the paste lands wherever they last
- *             clicked — almost always the chat input since that's what
- *             they were typing into a moment ago.
- *
- *         The frontmost-check + focus + paste happens in a single
- *         osascript invocation so we only pay for one process spawn.
+ *         We deliberately do NOT auto-focus the Cursor chat panel with ⌘L
+ *         any more. ⌘L is a toggle — if chat is already open and focused
+ *         it *closes* the panel, then the paste lands in whatever was
+ *         previously focused (usually the code editor) and autoSend turns
+ *         it into a newline in your source file. The in-app "keep the
+ *         mouse over the agent chat" hint now steers focus reliably
+ *         enough that the heuristic's cost outweighed its benefit.
  *
  *         Claude Code (terminal-based) and chat-web (no universal
- *         shortcut) don't get auto-focus at all; they rely on the user
- *         clicking the target themselves.
+ *         shortcut) rely on the user clicking the target themselves.
  *
  *   Win : writes to a temp file, loads into clipboard via PowerShell,
  *         then Ctrl+V via SendKeys.
@@ -172,21 +200,7 @@ function macDialog(title, message) {
 function pasteText(text) {
   if (MAC) {
     cp.execFileSync('pbcopy', [], { input: text });
-    if (currentPlatform === 'cursor') {
-      exec(
-        `osascript ` +
-        `-e 'tell application "System Events"' ` +
-        `-e   'set frontApp to name of first process whose frontmost is true' ` +
-        `-e   'if frontApp is not "Cursor" then' ` +
-        `-e     'keystroke "l" using command down' ` +
-        `-e     'delay 0.05' ` +
-        `-e   'end if' ` +
-        `-e   'keystroke "v" using command down' ` +
-        `-e 'end tell'`
-      );
-    } else {
-      exec(`osascript -e 'tell application "System Events" to keystroke "v" using command down'`);
-    }
+    sendKey(MAC_KEY.v, MAC_FLAG.CMD);
 
   } else if (WIN) {
     // Write to temp file to avoid any quoting issues
@@ -205,7 +219,9 @@ Add-Type -AssemblyName System.Windows.Forms
 
 /**
  * Trigger a named action (enter / run / esc / allow / interrupt / clearInput).
- * Mac : osascript key codes — no Accessibility permission needed for most key events.
+ * Mac : CGEventPost-synthesised key events via the scroll helper. No Apple
+ *       Events, no Automation permission — piggybacks on the Accessibility
+ *       permission already granted for scroll injection.
  * Win : PowerShell SendKeys.
  *
  * `enter` = plain ↵. Submits in most chat apps and terminals.
@@ -216,32 +232,35 @@ Add-Type -AssemblyName System.Windows.Forms
  *           use `enter` there, not `run`.
  * `allow` = Ctrl+↵. Cursor "allow action" / Claude Code tool-use approval.
  * `interrupt` = Ctrl+C. Stops the agent or sends SIGINT in a shell.
+ * `toggleAgentMode` = ⌘. (Mac) / Ctrl+. (Win). Cursor/Windsurf "switch mode"
+ *           shortcut — cycles Agent ↔ Ask ↔ Manual in the chat composer.
+ *           IDE-only on the phone side; other platforms don't send this.
  * `clearInput` = ⌘A then Delete (Mac) / Ctrl+A then Delete (Win). Select all
  *           text in the focused field and wipe it — the Mac equivalent of the
- *           phone's "start over" button.
+ *           phone's "start over" button. For Claude Code in a terminal we
+ *           use Ctrl+U instead, since readline "kill to beginning of line"
+ *           clears the prompt cleanly without affecting scrollback.
  */
 function pressKey(action) {
   if (MAC) {
     if (action === 'clearInput') {
       if (currentPlatform === 'claude-code') {
-        // Ctrl+U = readline "kill to beginning of line" — clears the whole
-        // terminal input without affecting anything else on screen.
-        exec(`osascript -e 'tell application "System Events" to keystroke "u" using control down'`);
+        sendKey(MAC_KEY.u, MAC_FLAG.CTRL);
       } else {
-        // ⌘A + Delete — select all text in the focused field then wipe it.
-        exec(`osascript -e 'tell application "System Events" to keystroke "a" using command down'`);
-        exec(`osascript -e 'tell application "System Events" to key code 51'`);
+        sendKey(MAC_KEY.a, MAC_FLAG.CMD);
+        sendKey(MAC_KEY.backspace, 0);
       }
       return;
     }
-    const scripts = {
-      enter     : `osascript -e 'tell application "System Events" to key code 36'`,
-      run       : `osascript -e 'tell application "System Events" to keystroke return using command down'`,
-      esc       : `osascript -e 'tell application "System Events" to key code 53'`,
-      allow     : `osascript -e 'tell application "System Events" to keystroke return using control down'`,
-      interrupt : `osascript -e 'tell application "System Events" to keystroke "c" using control down'`,
-    };
-    if (scripts[action]) exec(scripts[action]);
+    switch (action) {
+      case 'enter':     sendKey(MAC_KEY.return, 0);              break;
+      case 'run':       sendKey(MAC_KEY.return, MAC_FLAG.CMD);   break;
+      case 'esc':       sendKey(MAC_KEY.escape, 0);              break;
+      case 'allow':     sendKey(MAC_KEY.return, MAC_FLAG.CTRL);  break;
+      case 'interrupt': sendKey(MAC_KEY.c,      MAC_FLAG.CTRL);  break;
+      case 'toggleAgentMode':
+        sendKey(MAC_KEY.period, MAC_FLAG.CMD);                   break;
+    }
 
   } else if (WIN) {
     if (action === 'clearInput') {
@@ -256,6 +275,8 @@ Start-Sleep -Milliseconds 20
     const keys = {
       enter: '{ENTER}', run: '^{ENTER}', esc: '{ESC}',
       allow: '^{ENTER}', interrupt: '^c',
+      // SendKeys treats '.' literally, so Ctrl+. is just '^.'.
+      toggleAgentMode: '^.',
     };
     if (keys[action]) runPS(`
 Add-Type -AssemblyName System.Windows.Forms
@@ -276,13 +297,13 @@ Add-Type -AssemblyName System.Windows.Forms
  */
 function scrollTick(direction) {
   if (MAC) {
-    // key codes: up=126, down=125, left=123, right=124
-    const codes = { up: 126, down: 125, left: 123, right: 124 };
+    const codes = {
+      up:    MAC_KEY.up,    down:  MAC_KEY.down,
+      left:  MAC_KEY.left,  right: MAC_KEY.right,
+    };
     const code = codes[direction];
     if (code === undefined) return;
-    cp.exec(`osascript -e 'tell application "System Events" to key code ${code}'`, (err) => {
-      if (err) handleKeystrokeError(err, `scroll ${direction}`);
-    });
+    sendKey(code, 0);
 
   } else if (WIN) {
     const keys = { up: '{UP}', down: '{DOWN}', left: '{LEFT}', right: '{RIGHT}' };
@@ -321,6 +342,47 @@ const SE = Application('System Events')
 
 const stdin = $.NSFileHandle.fileHandleWithStandardInput
 let buffer = ''
+
+// ── Keyboard events via CGEventPost ──────────────────────────────────────────
+// We synthesise keyboard events through CoreGraphics directly rather than
+// via 'tell application "System Events" to keystroke …'. Two reasons:
+//
+//   1. The Apple Events route requires Automation permission on System
+//      Events in addition to the Accessibility permission we already need
+//      for CGScrollWheelEvent. LaunchAgents run headless, so the user is
+//      never prompted — paste silently fails with error -1743. CGEventPost
+//      only needs Accessibility, which is already granted for the scroll
+//      path above.
+//
+//   2. One IPC channel for both scrolls and keys (via stdin protocol) means
+//      fewer moving parts and no per-keystroke osascript spawn overhead.
+//
+// Protocol (line-oriented, newline-terminated):
+//   "dx,dy"           → scroll pixels (back-compat, unprefixed).
+//   "K:code,flags"    → keyboard event. code = CGKeyCode (virtual key),
+//                       flags = bitmask of CGEventFlagMask_* values.
+const FLAG_SHIFT = 0x00020000  // kCGEventFlagMaskShift
+const FLAG_CTRL  = 0x00040000  // kCGEventFlagMaskControl
+const FLAG_ALT   = 0x00080000  // kCGEventFlagMaskAlternate
+const FLAG_CMD   = 0x00100000  // kCGEventFlagMaskCommand
+
+function postKey(keyCode, flags) {
+  // Down + up paired as a single keystroke. Modifier flags are applied
+  // to both events so target apps see a consistent modifier state for
+  // the full duration of the press.
+  const down = $.CGEventCreateKeyboardEvent($(), keyCode, true)
+  const up   = $.CGEventCreateKeyboardEvent($(), keyCode, false)
+  if (!down || !up) return
+  if (flags) {
+    $.CGEventSetFlags(down, flags)
+    $.CGEventSetFlags(up, flags)
+  }
+  // kCGHIDEventTap = 0 — post at the HID-level tap so the event re-enters
+  // the normal event pipeline and is delivered to whatever app is
+  // frontmost, exactly like a real keyboard press.
+  $.CGEventPost(0, down)
+  $.CGEventPost(0, up)
+}
 
 // Cached scroll target in global display coords (points, origin top-left).
 // null → fall back to the current cursor location (pre-1.5 behaviour).
@@ -414,6 +476,16 @@ function refreshFrame() {
 }
 
 function handleLine(line) {
+  // Keyboard event: "K:code,flags" — see protocol notes at top of file.
+  if (line.length > 2 && line.charAt(0) === 'K' && line.charAt(1) === ':') {
+    const kparts = line.slice(2).split(',')
+    const kcode = parseInt(kparts[0], 10) | 0
+    const kflags = kparts.length > 1 ? (parseInt(kparts[1], 10) | 0) : 0
+    if (kcode > 0) postKey(kcode, kflags)
+    return
+  }
+
+  // Scroll event: "dx,dy" (legacy, no prefix).
   const parts = line.split(',')
   if (parts.length < 2) return
   const dx = parseInt(parts[0], 10) | 0
@@ -626,7 +698,8 @@ function handleMessage(msg) {
     catch (e) { handleKeystrokeError(e, 'paste'); }
 
   } else if (type === 'enter' || type === 'esc' || type === 'run'
-          || type === 'allow' || type === 'interrupt' || type === 'clearInput') {
+          || type === 'allow' || type === 'interrupt' || type === 'clearInput'
+          || type === 'toggleAgentMode') {
     console.log(`[${type} · ${currentPlatform}]`);
     try { pressKey(type); }
     catch (e) { handleKeystrokeError(e, `key (${type})`); }

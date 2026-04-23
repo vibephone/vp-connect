@@ -50,6 +50,26 @@ Prints the pairing QR without starting a server — useful when connecting a new
 npx vp-connect --uninstall
 ```
 
+## Troubleshooting
+
+### Paste suddenly stops working after it was fine before (macOS)
+
+Symptoms: the phone shows its normal "connected" state, dictation seems to work, but nothing lands in your editor. Check with:
+
+```bash
+launchctl list | grep vp-connect
+```
+
+If the `Status` column shows `78` (or any non-zero number) instead of `0`, the background service is crash-looping. The most common cause is a **stale `node` path** inside the LaunchAgent plist — the node binary that was present when you ran `--install` has since moved or been removed (nvm upgrade, homebrew cleanup, Cursor helper reshuffled, etc.). The plist still points at the old absolute path, so macOS can't launch the service.
+
+Fix in one line — re-run the installer from a shell that has a working `node`:
+
+```bash
+npx vp-connect --install
+```
+
+This rewrites the plist with the node path from the shell you ran it in, bootstraps the service, and prints a fresh QR. Your phone pairing survives.
+
 ## How it works
 
 `vp-connect` opens a TCP socket on port `38555`. The Vibr iOS app connects over your local Wi-Fi and sends JSON commands:
