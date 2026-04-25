@@ -1,9 +1,20 @@
 {
   "name": "vp-connect",
-  "version": "1.6.5",
-  "description": "Vibr server — lets your iPhone control Claude Code (or any IDE) on Mac/Windows via TCP",
+  "version": "1.7.0",
+  "description": "Vibephone server — lets your iPhone control Claude Code (or any IDE) on Mac/Windows via TCP",
   "bin": {
     "vp-connect": "bin/vp-connect.js"
+  },
+  "files": [
+    "bin/",
+    "vendor/macos/vp-helper",
+    "vendor/macos/vp-helper.swift",
+    "vendor/macos/build.sh",
+    "README.md"
+  ],
+  "scripts": {
+    "build:helper": "vendor/macos/build.sh",
+    "prepublishOnly": "vendor/macos/build.sh"
   },
   "dependencies": {
     "bonjour-service": "^1.2.1",
@@ -13,7 +24,7 @@
     "node": ">=18"
   },
   "keywords": [
-    "vibr",
+    "vibephone",
     "claude-code",
     "voice",
     "tcp",

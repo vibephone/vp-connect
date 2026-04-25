@@ -1,6 +1,6 @@
 # vp-connect
 
-Mac & Windows server for the Vibr iOS app.  
+Mac & Windows server for the Vibephone iOS app.  
 Lets you dictate voice commands from your iPhone directly into Claude Code (or any IDE).
 
 ## Requirements
@@ -16,9 +16,9 @@ Paste this into your terminal — it installs and starts the server automaticall
 npx vp-connect --install
 ```
 
-The command prints a **QR code** at the end. In the Vibr app tap **Connect** and scan the QR — no typing required.
+The command prints a **QR code** at the end. In the Vibephone app tap **Connect** and scan the QR — no typing required.
 
-> **macOS note:** The installer will prompt you to grant **Accessibility** permission the first time. This is required so `vp-connect` can paste what you dictate (Cmd+V). System Settings will open automatically — toggle ON the `node` entry. After granting it, run `npx vp-connect --verify` to confirm.
+> **macOS note:** The installer will prompt you to grant **Accessibility** permission the first time. This is required so `vp-connect` can paste what you dictate, drive your Mac cursor from the phone trackpad, and synthesise clicks. System Settings will open automatically — toggle ON the `node` entry. After granting it, run `npx vp-connect --verify` to confirm.
 
 ## Run manually (foreground)
 
@@ -72,7 +72,7 @@ This rewrites the plist with the node path from the shell you ran it in, bootstr
 
 ## How it works
 
-`vp-connect` opens a TCP socket on port `38555`. The Vibr iOS app connects over your local Wi-Fi and sends JSON commands:
+`vp-connect` opens a TCP socket on port `38555`. The Vibephone iOS app connects over your local Wi-Fi and sends JSON commands:
 
 | Command | What happens |
 |---|---|
@@ -83,6 +83,31 @@ This rewrites the plist with the node path from the shell you ran it in, bootstr
 | ESC | Sends the Escape key |
 | ALLOW | Sends Ctrl+↵ — accepts Cursor's "allow action" prompt and Claude Code tool-use confirmations |
 | STOP | Sends Ctrl+C — interrupts a running agent or terminal command |
-| Trackpad   | macOS: pixel-smooth Core Graphics scroll-wheel events (honours your natural-scroll setting, supports momentum/flicks). Scrolls are routed to **wherever your Mac's mouse cursor is parked** via `CGEventSetLocation`, so hover over the pane you want to scroll and the phone trackpad just drives it — no focus stealing, no cursor jump. Windows / fallback: arrow-key ticks (↑ ↓ ← →). |
+| Trackpad   | macOS: full MacBook-trackpad gestures. **1 finger drag** moves the Mac cursor (CGEventMouseMoved). **1 finger tap** = primary click. **2 finger drag** = pixel-smooth scroll (Core Graphics scroll-wheel events with momentum, honours natural-scroll). **2 finger tap** = secondary (right) click. Windows / fallback: arrow-key ticks (↑ ↓ ← →). |
+
+## Architecture
+
+`vp-connect` is a small Node TCP server (`bin/vp-connect.js`) plus a
+**native Swift helper** (`vendor/macos/vp-helper`) that does the actual
+CoreGraphics event injection. The helper is a tiny universal binary
+(~200 KB) that ships prebuilt inside the npm tarball, so installation is
+unchanged: `npx vp-connect --install` copies both files to
+`~/.vp-connect/`.
+
+If the native helper is missing or unrunnable on your Mac (very rare —
+unsupported architecture, restrictive enterprise MDM, etc.), vp-connect
+falls back to a JXA helper script automatically. Same behavior, slightly
+higher latency on pointer drags. See `vendor/macos/README.md` for build
+details.
+
+## Tuning
+
+| Env var | Default | Effect |
+|---|---|---|
+| `VP_POINTER_SENSITIVITY` | `1.7` | Cursor-acceleration multiplier for the phone trackpad. `1.0` = 1pt-finger maps to 1pt-on-Mac. Higher = faster. macOS only. |
+| `VP_PORT` | `38555` | TCP port the server listens on. Change both ends if a firewall blocks the default. |
+| `VP_LOG_TEXT` | unset | Set to `1` to log dictated text verbatim. **Off by default** — dictated text can contain passwords or private code. |
+
+To override on the LaunchAgent, edit `~/Library/LaunchAgents/com.vibephone.vp-connect.plist`, add the env var inside the existing `EnvironmentVariables` dict, then `launchctl unload && launchctl load` it.
 
 No Python, no dependencies — just Node.js built-ins.

@@ -50,7 +50,7 @@ function getLocalIP() {
  */
 function printPairingQR(ip, port) {
   const url = `vpconnect://${ip}:${port}`;
-  console.log('  Scan this QR from the Vibr app → Connect:\n');
+  console.log('  Scan this QR from the Vibephone app → Connect:\n');
   qrcode.generate(url, { small: true }, (qr) => {
     // Indent each line so the QR sits under the host/port banner
     console.log(qr.split('\n').map(l => '    ' + l).join('\n'));
@@ -168,9 +168,49 @@ const MAC_FLAG = {
  */
 function sendKey(keyCode, flags = 0) {
   if (!MAC) return false;
+  if (!scrollHelper) {
+    console.log(`[key→helper] DROPPED K:${keyCode|0},${flags|0} — helper not spawned`);
+    return false;
+  }
+  if (!scrollHelper.stdin.writable) {
+    console.log(`[key→helper] DROPPED K:${keyCode|0},${flags|0} — stdin not writable (helper exited?)`);
+    return false;
+  }
+  try {
+    const ok = scrollHelper.stdin.write(`K:${keyCode | 0},${flags | 0}\n`);
+    // `write` returns false if the internal buffer is full (back-pressure),
+    // but the data is still queued — so true=fully flushed, false=queued.
+    // Both are "delivered to helper" from our perspective.
+    console.log(`[key→helper] wrote K:${keyCode|0},${flags|0} (flushed=${ok})`);
+    return true;
+  } catch (e) {
+    console.log(`[key→helper] THREW K:${keyCode|0},${flags|0} — ${e && e.message}`);
+    return false;
+  }
+}
+
+/** Pipe a relative mouse move into the scroll helper. dx/dy are point
+ *  deltas straight from the phone — the helper applies sensitivity
+ *  scaling. Fire-and-forget; returns false if the helper isn't running. */
+function sendMouseMove(dx, dy) {
+  if (!MAC) return false;
   if (!scrollHelper || !scrollHelper.stdin.writable) return false;
   try {
-    scrollHelper.stdin.write(`K:${keyCode | 0},${flags | 0}\n`);
+    scrollHelper.stdin.write(`M:${dx | 0},${dy | 0}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Click (left or right) at the current cursor position via the scroll
+ *  helper. Mirrors a Mac-trackpad tap. */
+function sendMouseClick(button) {
+  if (!MAC) return false;
+  if (!scrollHelper || !scrollHelper.stdin.writable) return false;
+  const b = (button === 'right') ? 'right' : 'left';
+  try {
+    scrollHelper.stdin.write(`C:${b}\n`);
     return true;
   } catch {
     return false;
@@ -180,24 +220,19 @@ function sendKey(keyCode, flags = 0) {
 /**
  * Paste text into the focused application.
  *
- *   Mac : copies via pbcopy (handles all Unicode), pastes with ⌘V synthesised
- *         through CGEventPost (via the scroll helper).
- *
- *         We deliberately do NOT auto-focus the Cursor chat panel with ⌘L
- *         any more. ⌘L is a toggle — if chat is already open and focused
- *         it *closes* the panel, then the paste lands in whatever was
- *         previously focused (usually the code editor) and autoSend turns
- *         it into a newline in your source file. The in-app "keep the
- *         mouse over the agent chat" hint now steers focus reliably
- *         enough that the heuristic's cost outweighed its benefit.
- *
- *         Claude Code (terminal-based) and chat-web (no universal
- *         shortcut) rely on the user clicking the target themselves.
+ *   Mac : copies via pbcopy (handles all Unicode), pastes with ⌘V
+ *         synthesised through CGEventPost (via the scroll helper).
+ *         The phone now drives the Mac mouse directly via the
+ *         trackpad → tap-to-click flow, so the user is responsible
+ *         for parking focus in their target text field before
+ *         dictating. We never auto-toggle the chat panel any more
+ *         (no speculative ⌘L) — it caused too many "panel closed
+ *         on me" surprises in IDEs whose chat input we can't see.
  *
  *   Win : writes to a temp file, loads into clipboard via PowerShell,
  *         then Ctrl+V via SendKeys.
  */
-function pasteText(text) {
+function pasteText(text, platform) {
   if (MAC) {
     cp.execFileSync('pbcopy', [], { input: text });
     sendKey(MAC_KEY.v, MAC_FLAG.CMD);
@@ -361,10 +396,37 @@ let buffer = ''
 //   "dx,dy"           → scroll pixels (back-compat, unprefixed).
 //   "K:code,flags"    → keyboard event. code = CGKeyCode (virtual key),
 //                       flags = bitmask of CGEventFlagMask_* values.
+//   "M:dx,dy"         → relative mouse move in points. We sample the
+//                       cursor's current location (cheap CGEvent call),
+//                       add the scaled delta, and post a kCGEventMouseMoved
+//                       event at the new spot.
+//   "C:left|right"    → mouse click at the current cursor location. left
+//                       = primary (1-finger tap on phone), right =
+//                       secondary (2-finger tap).
 const FLAG_SHIFT = 0x00020000  // kCGEventFlagMaskShift
 const FLAG_CTRL  = 0x00040000  // kCGEventFlagMaskControl
 const FLAG_ALT   = 0x00080000  // kCGEventFlagMaskAlternate
 const FLAG_CMD   = 0x00100000  // kCGEventFlagMaskCommand
+
+// CGEvent type constants (subset we use)
+const EV_MOUSE_MOVED      = 5    // kCGEventMouseMoved
+const EV_LEFT_MOUSE_DOWN  = 1    // kCGEventLeftMouseDown
+const EV_LEFT_MOUSE_UP    = 2    // kCGEventLeftMouseUp
+const EV_RIGHT_MOUSE_DOWN = 3    // kCGEventRightMouseDown
+const EV_RIGHT_MOUSE_UP   = 4    // kCGEventRightMouseUp
+const BTN_LEFT  = 0              // kCGMouseButtonLeft
+const BTN_RIGHT = 1              // kCGMouseButtonRight
+
+// Cursor-acceleration multiplier. The phone sends raw point deltas from a
+// finger drag; we scale them into Mac screen points so a slow swipe still
+// feels precise but a fast flick covers usable distance. 1.0 = 1:1 (sluggish
+// on a 6.9" phone). Tunable via VP_POINTER_SENSITIVITY env var.
+const POINTER_SENS = (() => {
+  const raw = $.NSProcessInfo.processInfo.environment.objectForKey('VP_POINTER_SENSITIVITY')
+  const s = ObjC.unwrap(raw)
+  const n = s ? parseFloat(s) : NaN
+  return (isFinite(n) && n > 0) ? n : 1.7
+})()
 
 function postKey(keyCode, flags) {
   // Down + up paired as a single keystroke. Modifier flags are applied
@@ -380,6 +442,50 @@ function postKey(keyCode, flags) {
   // kCGHIDEventTap = 0 — post at the HID-level tap so the event re-enters
   // the normal event pipeline and is delivered to whatever app is
   // frontmost, exactly like a real keyboard press.
+  $.CGEventPost(0, down)
+  $.CGEventPost(0, up)
+}
+
+// ── Mouse events (synthetic pointer + clicks) ────────────────────────────────
+// Both mouse move and click need the cursor's current location: clicks
+// are dispatched at wherever the pointer currently sits, mouse-move is a
+// relative delta. CGEventCreate(NULL) returns a fresh event whose
+// timestamped location is the live cursor position — much cheaper than
+// querying System Events.
+function currentCursor() {
+  try {
+    const evt = $.CGEventCreate($())
+    if (!evt) return null
+    const loc = $.CGEventGetLocation(evt)
+    return { x: loc.x, y: loc.y }
+  } catch (e) {
+    return null
+  }
+}
+
+function postMouseMove(dx, dy) {
+  const cur = currentCursor()
+  if (!cur) return
+  const nx = cur.x + dx * POINTER_SENS
+  const ny = cur.y + dy * POINTER_SENS
+  // CGEventCreateMouseEvent(source, mouseType, mouseCursorPosition, mouseButton)
+  // mouseButton is ignored for kCGEventMouseMoved but the API still
+  // requires the slot — pass left as a harmless default.
+  const evt = $.CGEventCreateMouseEvent($(), EV_MOUSE_MOVED, { x: nx, y: ny }, BTN_LEFT)
+  if (!evt) return
+  $.CGEventPost(0, evt)
+}
+
+function postMouseClick(button) {
+  const cur = currentCursor()
+  if (!cur) return
+  const isRight = (button === 'right')
+  const downType = isRight ? EV_RIGHT_MOUSE_DOWN : EV_LEFT_MOUSE_DOWN
+  const upType   = isRight ? EV_RIGHT_MOUSE_UP   : EV_LEFT_MOUSE_UP
+  const btn      = isRight ? BTN_RIGHT           : BTN_LEFT
+  const down = $.CGEventCreateMouseEvent($(), downType, cur, btn)
+  const up   = $.CGEventCreateMouseEvent($(), upType,   cur, btn)
+  if (!down || !up) return
   $.CGEventPost(0, down)
   $.CGEventPost(0, up)
 }
@@ -485,6 +591,21 @@ function handleLine(line) {
     return
   }
 
+  // Mouse move: "M:dx,dy" — relative to the cursor's current position.
+  if (line.length > 2 && line.charAt(0) === 'M' && line.charAt(1) === ':') {
+    const mparts = line.slice(2).split(',')
+    const mdx = parseInt(mparts[0], 10) | 0
+    const mdy = parseInt(mparts[1], 10) | 0
+    if (mdx || mdy) postMouseMove(mdx, mdy)
+    return
+  }
+
+  // Mouse click: "C:left" or "C:right" — at the current cursor location.
+  if (line.length > 2 && line.charAt(0) === 'C' && line.charAt(1) === ':') {
+    postMouseClick(line.slice(2).trim())
+    return
+  }
+
   // Scroll event: "dx,dy" (legacy, no prefix).
   const parts = line.split(',')
   if (parts.length < 2) return
@@ -544,9 +665,53 @@ while (true) {
 }
 `;
 
-const SCROLL_HELPER_PATH = path.join(INSTALL_DIR, 'scroll-helper.js');
+// ── Helper process management ────────────────────────────────────────────────
+//
+// We have two implementations of the same line-protocol:
+//
+//   1. NATIVE  — `vendor/macos/vp-helper`, a tiny Swift CLI compiled to a
+//      universal Mach-O. ~50–200 µs per event, no GC, no JS interpreter.
+//      This is the default when the prebuilt binary is bundled with the
+//      npm package (which it always is for published versions).
+//
+//   2. JXA     — the embedded JavaScript-for-Automation `SCROLL_HELPER_JS`
+//      string above, run via `osascript -l JavaScript`. Slower (1–3 ms/
+//      event with occasional 10–30 ms tail spikes) but works without any
+//      native binary, so we keep it as a fallback for cases where the
+//      shipped binary is missing or unrunnable.
+//
+// `scrollHelper` is the spawned child either way. The send* functions all
+// just `write()` to its stdin so they don't care which implementation is
+// running underneath.
+
+const NATIVE_HELPER_INSTALLED = path.join(INSTALL_DIR, 'vp-helper');
+const SCROLL_HELPER_PATH      = path.join(INSTALL_DIR, 'scroll-helper.js');
+
 let scrollHelper = null;          // spawned child_process or null
 let scrollHelperFailed = false;   // true once we've given up on restarting
+let activeHelperKind = null;      // 'native' | 'jxa'
+
+/** Resolve the path to the prebuilt native helper.
+ *
+ *  Resolution order:
+ *    1. `~/.vp-connect/vp-helper`   — the path the installer copies it to.
+ *       This is what runs after `npx vp-connect --install` completes.
+ *    2. `<package>/vendor/macos/vp-helper` — the binary bundled inside the
+ *       npm tarball / a local checkout. Used during foreground `npx
+ *       vp-connect` runs and during development before --install. */
+function findNativeHelper() {
+  if (!MAC) return null;
+  for (const p of [
+    NATIVE_HELPER_INSTALLED,
+    path.join(__dirname, '..', 'vendor', 'macos', 'vp-helper'),
+  ]) {
+    try {
+      const st = fs.statSync(p);
+      if (st.isFile()) return p;
+    } catch {}
+  }
+  return null;
+}
 
 function ensureScrollHelperSource() {
   try {
@@ -556,40 +721,87 @@ function ensureScrollHelperSource() {
       fs.writeFileSync(SCROLL_HELPER_PATH, SCROLL_HELPER_JS);
     }
   } catch (e) {
-    console.log('[scroll-helper] cannot write helper script:', e.message);
+    console.log('[helper] cannot write JXA fallback script:', e.message);
     throw e;
+  }
+}
+
+/** Spawn the native binary. Returns the child_process if it stayed up
+ *  long enough to be considered healthy, or null if it failed to start. */
+function spawnNativeHelper(binPath) {
+  try {
+    const child = cp.spawn(binPath, [], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+    if (!child.pid) return null;
+    return child;
+  } catch (e) {
+    console.log('[helper] native spawn failed:', e.message);
+    return null;
+  }
+}
+
+function spawnJxaHelper() {
+  try {
+    ensureScrollHelperSource();
+    return cp.spawn('osascript', ['-l', 'JavaScript', SCROLL_HELPER_PATH], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+  } catch (e) {
+    console.log('[helper] JXA spawn failed:', e.message);
+    return null;
   }
 }
 
 function startScrollHelper() {
   if (!MAC || scrollHelperFailed || scrollHelper) return;
-  try {
-    ensureScrollHelperSource();
-    scrollHelper = cp.spawn('osascript', ['-l', 'JavaScript', SCROLL_HELPER_PATH], {
-      stdio: ['pipe', 'ignore', 'pipe'],
-    });
-    scrollHelper.on('exit', (code, signal) => {
-      console.log(`[scroll-helper] exited code=${code} signal=${signal || ''}`);
-      scrollHelper = null;
-      // If it died abnormally, retry once after a short delay; give up if
-      // it keeps dying (probably means JXA can't run on this box).
-      if (!scrollHelperFailed) setTimeout(() => {
-        if (!scrollHelper) startScrollHelper();
-      }, 2000);
-    });
-    scrollHelper.on('error', (e) => {
-      console.log('[scroll-helper] spawn error:', e.message);
-      scrollHelperFailed = true;
-      scrollHelper = null;
-    });
-    scrollHelper.stderr.on('data', (chunk) => {
-      const msg = chunk.toString().trim();
-      if (msg) console.log('[scroll-helper stderr]', msg);
-    });
-    console.log('[scroll-helper] started (pixel-smooth scrolling active)');
-  } catch (e) {
+
+  // Prefer the native binary when present. Fall back to JXA otherwise so
+  // an unbuilt source checkout still works.
+  let kind = null;
+  let child = null;
+  const nativePath = findNativeHelper();
+  if (nativePath) {
+    child = spawnNativeHelper(nativePath);
+    if (child) kind = 'native';
+  }
+  if (!child) {
+    child = spawnJxaHelper();
+    if (child) kind = 'jxa';
+  }
+  if (!child) {
+    console.log('[helper] could not start any backend — events will no-op');
+    scrollHelperFailed = true;
+    return;
+  }
+
+  scrollHelper = child;
+  activeHelperKind = kind;
+
+  scrollHelper.on('exit', (code, signal) => {
+    console.log(`[helper:${activeHelperKind}] exited code=${code} signal=${signal || ''}`);
+    scrollHelper = null;
+    activeHelperKind = null;
+    // If it died abnormally, retry once after a short delay. We try the
+    // same backend first; if it keeps dying we'll naturally try the
+    // fallback on the next attempt.
+    if (!scrollHelperFailed) setTimeout(() => {
+      if (!scrollHelper) startScrollHelper();
+    }, 2000);
+  });
+  scrollHelper.on('error', (e) => {
+    console.log(`[helper:${activeHelperKind}] spawn error:`, e.message);
     scrollHelperFailed = true;
     scrollHelper = null;
+  });
+  scrollHelper.stderr.on('data', (chunk) => {
+    const msg = chunk.toString().trim();
+    if (msg) console.log(`[helper:${activeHelperKind} stderr]`, msg);
+  });
+  if (kind === 'native') {
+    console.log(`[helper] started (native vp-helper, low-latency event injection)`);
+  } else {
+    console.log('[helper] started (JXA fallback — install vp-helper for lower latency)');
   }
 }
 
@@ -694,7 +906,7 @@ function handleMessage(msg) {
       ? JSON.stringify(text)
       : `${text.length} chars, ${text.split(/\s+/).filter(Boolean).length} words`;
     console.log(`[text:${msg.mode || 'plain'} · ${currentPlatform}] ${summary}`);
-    try { pasteText(text); }
+    try { pasteText(text, currentPlatform); }
     catch (e) { handleKeystrokeError(e, 'paste'); }
 
   } else if (type === 'enter' || type === 'esc' || type === 'run'
@@ -732,6 +944,24 @@ function handleMessage(msg) {
       }
     }
 
+  } else if (type === 'mouseMove') {
+    // 1-finger drag on the phone trackpad → relative cursor move on the
+    // Mac. Fire-and-forget at high rates (~60 Hz during a drag); we
+    // aggregate logs into bursts so they don't spam the console.
+    const dx = (parseInt(msg.dx, 10) || 0) | 0;
+    const dy = (parseInt(msg.dy, 10) || 0) | 0;
+    if (!dx && !dy) return;
+    logMouseMove(dx, dy);
+    sendMouseMove(dx, dy);
+
+  } else if (type === 'mouseClick') {
+    // 1-finger tap → primary click; 2-finger tap → secondary click.
+    // Fired at the cursor's current screen location (whatever the user
+    // just moved the pointer onto with mouseMove).
+    const button = String(msg.button || 'left') === 'right' ? 'right' : 'left';
+    console.log(`[click ${button} · ${currentPlatform}]`);
+    sendMouseClick(button);
+
   } else if (type === 'platform') {
     // Phone announced a platform switch (or its initial platform on connect).
     // No keymap routing yet, but acknowledge it so we don't spam warnings.
@@ -741,6 +971,28 @@ function handleMessage(msg) {
   } else {
     console.log('[warn] unknown message type:', JSON.stringify(msg));
   }
+}
+
+// Coalesce mouseMove ticks into bursts so dragging across the screen
+// produces one log line per "gesture" instead of dozens per second.
+const moveBurst = { sumX: 0, sumY: 0, count: 0, timer: null };
+function logMouseMove(dx, dy) {
+  moveBurst.sumX += dx;
+  moveBurst.sumY += dy;
+  moveBurst.count += 1;
+  if (moveBurst.timer) clearTimeout(moveBurst.timer);
+  moveBurst.timer = setTimeout(flushMoveBurst, 400);
+}
+function flushMoveBurst() {
+  if (moveBurst.count > 0) {
+    console.log(
+      `[move px · ${currentPlatform}] Δx=${moveBurst.sumX} Δy=${moveBurst.sumY} (${moveBurst.count} ticks)`
+    );
+  }
+  moveBurst.sumX = 0;
+  moveBurst.sumY = 0;
+  moveBurst.count = 0;
+  if (moveBurst.timer) { clearTimeout(moveBurst.timer); moveBurst.timer = null; }
 }
 
 // ── TCP server ───────────────────────────────────────────────────────────────
@@ -793,6 +1045,7 @@ function startServer() {
     socket.on('close', () => {
       flushScrollBurst();
       flushPixelBurst();
+      flushMoveBurst();
       console.log('[conn] disconnected — waiting for phone…');
     });
     socket.on('error', e  => console.log('[warn] socket:', e.message));
@@ -812,7 +1065,7 @@ function startServer() {
   server.listen(PORT, '0.0.0.0', () => {
     const line = '─'.repeat(50);
     console.log(line);
-    console.log('  vp-connect  |  Vibr server');
+    console.log('  vp-connect  |  Vibephone server');
     console.log(line);
     console.log(`  Platform : ${process.platform}`);
     console.log(`  IP       : ${currentIP}`);
@@ -846,6 +1099,26 @@ function install() {
   fs.mkdirSync(INSTALL_DIR, { recursive: true });
   fs.copyFileSync(__filename, INSTALLED_BIN);
   console.log(`  ✓ Script saved to  ${INSTALLED_BIN}`);
+
+  // Copy the bundled native event-injection helper (Swift CLI) alongside,
+  // preserving its executable bit + ad-hoc code signature. The runtime
+  // resolver checks `INSTALL_DIR/vp-helper` first and only falls back to
+  // the embedded JXA helper if the binary is missing or unrunnable.
+  if (MAC) {
+    const bundledHelper = path.join(__dirname, '..', 'vendor', 'macos', 'vp-helper');
+    try {
+      const st = fs.statSync(bundledHelper);
+      if (st.isFile()) {
+        fs.copyFileSync(bundledHelper, NATIVE_HELPER_INSTALLED);
+        fs.chmodSync(NATIVE_HELPER_INSTALLED, 0o755);
+        console.log(`  ✓ Native helper installed at ${NATIVE_HELPER_INSTALLED}`);
+      } else {
+        console.log('  i  Bundled vp-helper not found — JXA fallback will be used (slower)');
+      }
+    } catch {
+      console.log('  i  Bundled vp-helper not found — JXA fallback will be used (slower)');
+    }
+  }
 
   // Install runtime deps into INSTALL_DIR so the LaunchAgent can resolve them
   // independently of the npx cache (which may be cleaned between runs).
