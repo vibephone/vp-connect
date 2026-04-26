@@ -1181,10 +1181,14 @@ function startServer() {
 async function install() {
   console.log('\nInstalling vp-connect as a background service…\n');
 
-  // Copy this script to a stable location so the service can find it after npx cache clears
+  // Copy this script + its sibling runtime module to a stable location so
+  // the service can find them after npx cache clears.
   fs.mkdirSync(INSTALL_DIR, { recursive: true });
   fs.copyFileSync(__filename, INSTALLED_BIN);
-  console.log(`  ✓ Script saved to  ${INSTALLED_BIN}`);
+  const runtimeSrc  = path.join(__dirname, 'runtime.js');
+  const runtimeDest = path.join(INSTALL_DIR, 'runtime.js');
+  fs.copyFileSync(runtimeSrc, runtimeDest);
+  console.log(`  ✓ Scripts saved to ${INSTALL_DIR}`);
 
   // Copy the bundled native event-injection helper (Swift CLI) alongside,
   // preserving its executable bit + ad-hoc code signature. The runtime
