@@ -18,7 +18,9 @@ npx vp-connect --install
 
 The command prints a **QR code** at the end. In the Vibephone app tap **Connect** and scan the QR — no typing required.
 
-> **macOS note:** The installer will prompt you to grant **Accessibility** permission the first time. This is required so `vp-connect` can paste what you dictate, drive your Mac cursor from the phone trackpad, and synthesise clicks. System Settings will open automatically — toggle ON the `node` entry. After granting it, run `npx vp-connect --verify` to confirm.
+> **First-install note:** vp-connect downloads its own pinned Node runtime (~45 MB) into `~/.vp-connect/runtime/` so the background service doesn't depend on whichever `node` is on your PATH. This protects against PATH shuffles from agent toolchains (Hermes, OpenClaw, Cursor's bundled node), version managers (nvm, asdf, brew), and uninstalls. One-time download per major Node bump; reinstalls reuse the cached runtime.
+
+> **macOS note:** The installer will prompt you to grant **Accessibility** permission the first time. This is required so `vp-connect` can paste what you dictate, drive your Mac cursor from the phone trackpad, and synthesise clicks. System Settings will open automatically — toggle ON the `node` entry that points at `~/.vp-connect/runtime/.../bin/node`. After granting it, run `npx vp-connect --verify` to confirm.
 
 ## Check the installed version
 
@@ -69,15 +71,15 @@ Symptoms: the phone shows its normal "connected" state, dictation seems to work,
 launchctl list | grep vp-connect
 ```
 
-If the `Status` column shows `78` (or any non-zero number) instead of `0`, the background service is crash-looping. The most common cause is a **stale `node` path** inside the LaunchAgent plist — the node binary that was present when you ran `--install` has since moved or been removed (nvm upgrade, homebrew cleanup, Cursor helper reshuffled, etc.). The plist still points at the old absolute path, so macOS can't launch the service.
+If the `Status` column shows `78` (or any non-zero number) instead of `0`, the background service is crash-looping.
 
-Fix in one line — re-run the installer from a shell that has a working `node`:
+vp-connect ≥ 1.9 ships with a vendored Node runtime under `~/.vp-connect/runtime/`, so a stale `node` path is rare. If you upgraded from an older version and still see the issue, re-run:
 
 ```bash
-npx vp-connect --install
+npx vp-connect --uninstall && npx vp-connect@latest --install
 ```
 
-This rewrites the plist with the node path from the shell you ran it in, bootstraps the service, and prints a fresh QR. Your phone pairing survives.
+This wipes the old install, downloads the vendored runtime, rewrites the LaunchAgent plist to point at it, and prints a fresh QR. Your phone pairing survives.
 
 ## How it works
 
@@ -116,6 +118,7 @@ details.
 | `VP_POINTER_SENSITIVITY` | `1.7` | Cursor-acceleration multiplier for the phone trackpad. `1.0` = 1pt-finger maps to 1pt-on-Mac. Higher = faster. macOS only. |
 | `VP_PORT` | `38555` | TCP port the server listens on. Change both ends if a firewall blocks the default. |
 | `VP_LOG_TEXT` | unset | Set to `1` to log dictated text verbatim. **Off by default** — dictated text can contain passwords or private code. |
+| `VP_CONNECT_NODE` | unset | Path to a `node` binary to use instead of the vendored runtime. Set this on `npx vp-connect --install` to skip the ~45 MB download (e.g. air-gapped hosts, CI, or when you're sure your system node won't move). |
 
 To override on the LaunchAgent, edit `~/Library/LaunchAgents/com.vibephone.vp-connect.plist`, add the env var inside the existing `EnvironmentVariables` dict, then `launchctl unload && launchctl load` it.
 

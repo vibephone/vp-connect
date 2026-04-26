@@ -7,6 +7,7 @@ const fs   = require('fs');
 const path = require('path');
 const cp   = require('child_process');
 const qrcode = require('qrcode-terminal');
+const runtime = require('./runtime');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -1139,7 +1140,7 @@ function startServer() {
 
 // ── Install as background service ────────────────────────────────────────────
 
-function install() {
+async function install() {
   console.log('\nInstalling vp-connect as a background service…\n');
 
   // Copy this script to a stable location so the service can find it after npx cache clears
@@ -1167,8 +1168,19 @@ function install() {
     }
   }
 
-  // Install runtime deps into INSTALL_DIR so the LaunchAgent can resolve them
-  // independently of the npx cache (which may be cleaned between runs).
+  // Vendor a private Node runtime under ~/.vp-connect/runtime/ so the
+  // LaunchAgent / Scheduled Task is fully independent of the user's PATH.
+  // Without this, `process.execPath` (whichever node ran the installer
+  // — Hermes, OpenClaw, nvm, brew, system) gets baked into the service's
+  // launch arguments. When that node later moves or disappears, the
+  // service silently breaks. Vendoring pins the binary at a path we
+  // control. See runtime.js for the full rationale.
+  const { nodeBin, npmCli, vendored } = await runtime.ensureRuntime({ logger: console });
+
+  // Install runtime deps into INSTALL_DIR using the *vendored* node + npm
+  // so dep resolution is ABI-matched to the binary that will actually run
+  // the service. Falls back to system npm only when VP_CONNECT_NODE was
+  // set (i.e. the user opted out of vendoring).
   const pkg = require('../package.json') || {};
   const deps = pkg.dependencies || {};
   fs.writeFileSync(
@@ -1181,19 +1193,24 @@ function install() {
     }, null, 2)
   );
   try {
-    cp.execSync('npm install --no-audit --no-fund --silent', {
-      cwd: INSTALL_DIR,
-      stdio: 'inherit',
-    });
+    if (npmCli) {
+      cp.execFileSync(nodeBin, [npmCli, 'install', '--no-audit', '--no-fund', '--silent'], {
+        cwd: INSTALL_DIR,
+        stdio: 'inherit',
+      });
+    } else {
+      cp.execSync('npm install --no-audit --no-fund --silent', {
+        cwd: INSTALL_DIR,
+        stdio: 'inherit',
+      });
+    }
     console.log(`  ✓ Dependencies installed in ${INSTALL_DIR}`);
   } catch (e) {
     console.error('  ✗ Failed to install dependencies:', e.message);
     console.error('    The service will crash on launch. Install deps manually:');
-    console.error(`      cd ${INSTALL_DIR} && npm install`);
+    console.error(`      cd ${INSTALL_DIR} && ${nodeBin} ${npmCli || 'npm'} install`);
     process.exit(1);
   }
-
-  const nodeBin = process.execPath;
 
   if (MAC) {
     // LaunchAgent — starts on login, restarts on crash
@@ -1345,6 +1362,13 @@ function verify() {
     return;
   }
 
+  // The LaunchAgent runs under the *vendored* node (~/.vp-connect/runtime/…),
+  // not whichever node is on the user's PATH right now. Point them at that
+  // binary specifically — granting Accessibility to a different node won't
+  // help the service.
+  const vendoredNode = runtime.runtimeNodePath();
+  const targetNode = fs.existsSync(vendoredNode) ? vendoredNode : process.execPath;
+
   const probe = testAccessibility();
   if (probe.ok) {
     console.log('  ✓ Accessibility permission granted — paste will work');
@@ -1357,9 +1381,9 @@ function verify() {
     console.log('');
     console.log('  Fix:');
     console.log('    1. System Settings → Privacy & Security → Accessibility');
-    console.log(`    2. Toggle ON the "node" entry  (${process.execPath})`);
+    console.log(`    2. Toggle ON the "node" entry  (${targetNode})`);
     console.log('    3. If "node" is missing, drag it from the Finder window\n');
-    openAccessibilitySetup(process.execPath);
+    openAccessibilitySetup(targetNode);
     return;
   }
 
@@ -1370,7 +1394,15 @@ function verify() {
 // ── Entry ────────────────────────────────────────────────────────────────────
 
 const arg = process.argv[2];
-if      (arg === '--install')   install();
+if (arg === '--install') {
+  install().catch((e) => {
+    console.error('\n  ✗ Install failed:', e && e.message ? e.message : e);
+    console.error('    If this was a network issue, retry:  npx vp-connect --install');
+    console.error('    To skip the runtime download, point at an existing node:');
+    console.error('      VP_CONNECT_NODE=/path/to/node npx vp-connect --install\n');
+    process.exit(1);
+  });
+}
 else if (arg === '--uninstall') uninstall();
 else if (arg === '--verify')    verify();
 else if (arg === '--qr')        printQROnly();
