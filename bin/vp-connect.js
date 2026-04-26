@@ -28,6 +28,27 @@ const INSTALL_DIR = MAC
 const INSTALLED_BIN = path.join(INSTALL_DIR, 'vp-connect.js');
 const PLIST_PATH    = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
 
+/** npm package version (for `helloAck` to the iPhone). */
+let VP_CONNECT_VERSION = 'unknown';
+(function readPackageVersion() {
+  const tries = [
+    path.join(__dirname, '..', 'package.json'), // npx / node_modules/vp-connect/bin → pkg root
+    path.join(__dirname, 'package.json'),       // LaunchAgent: ~/.vp-connect/vp-connect.js + local mini package.json
+  ];
+  for (const p of tries) {
+    try {
+      VP_CONNECT_VERSION = require(p).version;
+      return;
+    } catch (_) { /* try next */ }
+  }
+})();
+
+/**
+ * Wire-protocol level negotiated with Vibephone over TCP (`hello` / `helloAck`).
+ * Bump only when older vp-connect builds cannot safely serve newer phones.
+ */
+const WIRE_PROTOCOL = 1;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function getLocalIP() {
@@ -234,7 +255,7 @@ function sendMouseClick(button) {
  */
 function pasteText(text, platform) {
   if (MAC) {
-    cp.execFileSync('pbcopy', [], { input: text });
+    cp.execFileSync('pbcopy', [], { input: text, encoding: 'utf8', env: { ...process.env, LANG: 'en_US.UTF-8' } });
     sendKey(MAC_KEY.v, MAC_FLAG.CMD);
 
   } else if (WIN) {
@@ -892,8 +913,34 @@ function handleKeystrokeError(e, context) {
   );
 }
 
-function handleMessage(msg) {
+function replyHelloAck(socket, msg) {
+  const clientProto = Number(msg.protocol) || 0;
+  const ok = clientProto >= 1 && clientProto <= WIRE_PROTOCOL;
+  const payload = {
+    type: 'helloAck',
+    ok,
+    protocol: WIRE_PROTOCOL,
+    negotiatedProtocol: ok ? clientProto : WIRE_PROTOCOL,
+    vpConnect: VP_CONNECT_VERSION,
+  };
+  if (!ok) {
+    payload.upgradeHint = 'Install a newer vp-connect: npx vp-connect@latest';
+  }
+  try {
+    socket.write(`${JSON.stringify(payload)}\n`);
+  } catch (_) { /* ignore */ }
+  console.log(
+    `[hello] protocol=${clientProto} app=${String(msg.app || '?')} → ok=${ok} vp-connect=${VP_CONNECT_VERSION}`,
+  );
+}
+
+function handleMessage(msg, socket) {
   const type = String(msg.type || '');
+
+  if (type === 'hello') {
+    replyHelloAck(socket, msg);
+    return;
+  }
 
   // Every message may carry a `platform` stamp; keep it fresh for future
   // per-platform keymap routing.
@@ -1037,7 +1084,7 @@ function startServer() {
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        try { handleMessage(JSON.parse(trimmed)); }
+        try { handleMessage(JSON.parse(trimmed), socket); }
         catch { console.log('[warn] invalid json:', JSON.stringify(trimmed)); }
       }
     });
@@ -1122,10 +1169,16 @@ function install() {
 
   // Install runtime deps into INSTALL_DIR so the LaunchAgent can resolve them
   // independently of the npx cache (which may be cleaned between runs).
-  const deps = (require('../package.json') || {}).dependencies || {};
+  const pkg = require('../package.json') || {};
+  const deps = pkg.dependencies || {};
   fs.writeFileSync(
     path.join(INSTALL_DIR, 'package.json'),
-    JSON.stringify({ name: 'vp-connect-install', private: true, dependencies: deps }, null, 2)
+    JSON.stringify({
+      name: 'vp-connect-install',
+      version: pkg.version || '0.0.0',
+      private: true,
+      dependencies: deps,
+    }, null, 2)
   );
   try {
     cp.execSync('npm install --no-audit --no-fund --silent', {
@@ -1167,6 +1220,8 @@ function install() {
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
     </dict>
 </dict>
 </plist>`;
@@ -1319,4 +1374,8 @@ if      (arg === '--install')   install();
 else if (arg === '--uninstall') uninstall();
 else if (arg === '--verify')    verify();
 else if (arg === '--qr')        printQROnly();
+else if (arg === '--version' || arg === '-v') {
+  console.log(VP_CONNECT_VERSION);
+  process.exit(0);
+}
 else                            startServer();

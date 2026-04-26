@@ -20,6 +20,15 @@ The command prints a **QR code** at the end. In the Vibephone app tap **Connect*
 
 > **macOS note:** The installer will prompt you to grant **Accessibility** permission the first time. This is required so `vp-connect` can paste what you dictate, drive your Mac cursor from the phone trackpad, and synthesise clicks. System Settings will open automatically — toggle ON the `node` entry. After granting it, run `npx vp-connect --verify` to confirm.
 
+## Check the installed version
+
+```bash
+npx vp-connect --version
+# or: npx vp-connect -v
+```
+
+Prints the npm package version of the `vp-connect` that Node resolves (same value the iPhone sees in `helloAck`). Latest on the registry: `npm view vp-connect version`.
+
 ## Run manually (foreground)
 
 If you just want to try it without installing:
@@ -72,7 +81,7 @@ This rewrites the plist with the node path from the shell you ran it in, bootstr
 
 ## How it works
 
-`vp-connect` opens a TCP socket on port `38555`. The Vibephone iOS app connects over your local Wi-Fi and sends JSON commands:
+`vp-connect` opens a TCP socket on port `38555`. The Vibephone iOS app connects over your local Wi-Fi and sends newline-delimited JSON. On connect the app sends a `hello` (wire protocol + app version); the server replies with `helloAck` including the running **vp-connect** semver so the phone can prompt you to upgrade if the Mac is behind.
 
 | Command | What happens |
 |---|---|
