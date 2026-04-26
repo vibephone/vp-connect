@@ -6,6 +6,7 @@ const os   = require('os');
 const fs   = require('fs');
 const path = require('path');
 const cp   = require('child_process');
+const crypto = require('crypto');
 const qrcode = require('qrcode-terminal');
 const runtime = require('./runtime');
 
@@ -28,6 +29,24 @@ const INSTALL_DIR = MAC
 
 const INSTALLED_BIN = path.join(INSTALL_DIR, 'vp-connect.js');
 const PLIST_PATH    = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
+const TOKEN_PATH    = path.join(INSTALL_DIR, '.auth-token');
+
+/** Persistent auth token shared between server and phone via QR code.
+ *  Set at startup by loadOrCreateToken(). */
+let AUTH_TOKEN = null;
+
+/** Load an existing token from disk, or generate and persist a new one.
+ *  The token is a 48-hex-char (24-byte) random string stored mode 0600. */
+function loadOrCreateToken() {
+  try {
+    const existing = fs.readFileSync(TOKEN_PATH, 'utf8').trim();
+    if (existing.length >= 32) return existing;
+  } catch {}
+  const token = crypto.randomBytes(24).toString('hex');
+  fs.mkdirSync(INSTALL_DIR, { recursive: true });
+  fs.writeFileSync(TOKEN_PATH, token, { mode: 0o600 });
+  return token;
+}
 
 /** npm package version (for `helloAck` to the iPhone). */
 let VP_CONNECT_VERSION = 'unknown';
@@ -71,7 +90,9 @@ function getLocalIP() {
  * (foreground) or `npx vp-connect --qr`.
  */
 function printPairingQR(ip, port) {
-  const url = `vpconnect://${ip}:${port}`;
+  const url = AUTH_TOKEN
+    ? `vpconnect://${ip}:${port}?token=${AUTH_TOKEN}`
+    : `vpconnect://${ip}:${port}`;
   console.log('  Scan this QR from the Vibephone app → Connect:\n');
   qrcode.generate(url, { small: true }, (qr) => {
     // Indent each line so the QR sits under the host/port banner
@@ -952,9 +973,10 @@ function handleKeystrokeError(e, context) {
   );
 }
 
-function replyHelloAck(socket, msg) {
+function replyHelloAck(socket, msg, tokenOk = true) {
   const clientProto = Number(msg.protocol) || 0;
-  const ok = clientProto >= 1 && clientProto <= WIRE_PROTOCOL;
+  const protoOk = clientProto >= 1 && clientProto <= WIRE_PROTOCOL;
+  const ok = protoOk && tokenOk;
   const payload = {
     type: 'helloAck',
     ok,
@@ -963,7 +985,12 @@ function replyHelloAck(socket, msg) {
     vpConnect: VP_CONNECT_VERSION,
   };
   if (!ok) {
-    payload.upgradeHint = 'Install a newer vp-connect: npx vp-connect@latest';
+    if (!tokenOk) {
+      payload.error = 'auth_failed';
+      payload.upgradeHint = 'Re-scan the QR code from vp-connect to update your pairing token.';
+    } else {
+      payload.upgradeHint = 'Install a newer vp-connect: npx vp-connect@latest';
+    }
   }
   try {
     socket.write(`${JSON.stringify(payload)}\n`);
@@ -977,7 +1004,23 @@ function handleMessage(msg, socket) {
   const type = String(msg.type || '');
 
   if (type === 'hello') {
-    replyHelloAck(socket, msg);
+    if (AUTH_TOKEN) {
+      const tokenOk = String(msg.token || '') === AUTH_TOKEN;
+      if (tokenOk) socket._vpAuth = true;
+      replyHelloAck(socket, msg, tokenOk);
+      if (!tokenOk) {
+        console.log(`[auth] bad token from ${socket.remoteAddress}, closing`);
+        socket.destroy();
+      }
+    } else {
+      socket._vpAuth = true;
+      replyHelloAck(socket, msg);
+    }
+    return;
+  }
+
+  if (AUTH_TOKEN && !socket._vpAuth) {
+    console.log(`[auth] dropping ${type} from unauthenticated ${socket.remoteAddress}`);
     return;
   }
 
@@ -1084,6 +1127,7 @@ function flushMoveBurst() {
 // ── TCP server ───────────────────────────────────────────────────────────────
 
 function startServer() {
+  AUTH_TOKEN = loadOrCreateToken();
   let currentIP = getLocalIP();
 
   // ── Network monitor ────────────────────────────────────────────────────────
@@ -1109,17 +1153,28 @@ function startServer() {
 
   // ── TCP server ─────────────────────────────────────────────────────────────
   const server = net.createServer(socket => {
-    // Match the phone: disable Nagle so each scrollDelta / keystroke frame
-    // is flushed immediately instead of waiting ~40 ms for coalescing.
     socket.setNoDelay(true);
+    socket._vpAuth = !AUTH_TOKEN;
     console.log(`\n[conn] connected: ${socket.remoteAddress}`);
+
+    const authTimer = AUTH_TOKEN ? setTimeout(() => {
+      if (!socket._vpAuth) {
+        console.log(`[auth] closing unauthenticated connection from ${socket.remoteAddress} (timeout)`);
+        socket.destroy();
+      }
+    }, 5000) : null;
 
     let buf = '';
 
     socket.on('data', chunk => {
       buf += chunk.toString('utf8');
+      if (buf.length > 1024 * 1024) {
+        console.log(`[warn] buffer overflow from ${socket.remoteAddress}, closing`);
+        socket.destroy();
+        return;
+      }
       const lines = buf.split('\n');
-      buf = lines.pop(); // hold incomplete last line
+      buf = lines.pop();
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
@@ -1129,6 +1184,7 @@ function startServer() {
     });
 
     socket.on('close', () => {
+      if (authTimer) clearTimeout(authTimer);
       flushScrollBurst();
       flushPixelBurst();
       flushMoveBurst();
@@ -1360,6 +1416,7 @@ Start-ScheduledTask -TaskName '${TASK_NAME}'
     console.log(`  Stop  →  npx vp-connect --uninstall\n`);
   }
 
+  AUTH_TOKEN = loadOrCreateToken();
   printPairingQR(getLocalIP(), PORT);
   console.log(`  (Reprint QR anytime with:  npx vp-connect --qr)\n`);
 }
@@ -1369,6 +1426,7 @@ Start-ScheduledTask -TaskName '${TASK_NAME}'
 /** Print the pairing QR to stdout without starting a server. Handy for
  *  re-pairing a new phone without reinstalling the background service. */
 function printQROnly() {
+  AUTH_TOKEN = loadOrCreateToken();
   const ip = getLocalIP();
   const line = '─'.repeat(50);
   console.log('');
