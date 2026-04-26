@@ -125,6 +125,44 @@ function testAccessibility() {
   }
 }
 
+/**
+ * Probe Accessibility against a *specific* node binary (typically the
+ * vendored runtime). TCC binds permission to the process that calls
+ * osascript, so a probe via the installer's node tells you nothing
+ * about whether the LaunchAgent's node will succeed. By spawning the
+ * vendored binary and having it run the same harmless keystroke probe,
+ * we get an authoritative answer for the exact binary that will run
+ * the service.
+ *
+ * Also useful when bumping NODE_VERSION: the new binary may have a
+ * different cdhash / signature and TCC will treat it as a fresh
+ * identity, requiring re-grant. This probe surfaces that immediately.
+ */
+function probeAccessibilityViaNode(nodeBin) {
+  if (!MAC) return { ok: true };
+  if (!nodeBin || !fs.existsSync(nodeBin)) {
+    return { ok: false, reason: 'unknown', msg: 'node binary missing' };
+  }
+  // Runs in the spawned node: try osascript, exit codes encode the result.
+  // 0 = ok, 2 = TCC block, 3 = other error.
+  const probe =
+    'try {' +
+    '  require("child_process").execFileSync("osascript", ["-e", \'tell application "System Events" to keystroke ""\'], { stdio: "pipe", timeout: 5000 });' +
+    '  process.exit(0);' +
+    '} catch (e) {' +
+    '  const m = String(e.stderr || e.message || "");' +
+    '  if (m.includes("1002") || m.toLowerCase().includes("not allowed")) process.exit(2);' +
+    '  process.exit(3);' +
+    '}';
+  try {
+    cp.execFileSync(nodeBin, ['-e', probe], { stdio: 'pipe', timeout: 10_000 });
+    return { ok: true };
+  } catch (e) {
+    if (e.status === 2) return { ok: false, reason: 'accessibility' };
+    return { ok: false, reason: 'unknown', msg: String(e.stderr || e.message || '') };
+  }
+}
+
 /** macOS-only. Opens the Accessibility settings pane and reveals the given binary in Finder. */
 function openAccessibilitySetup(binary) {
   if (!MAC) return;
@@ -1181,8 +1219,14 @@ async function install() {
   // so dep resolution is ABI-matched to the binary that will actually run
   // the service. Falls back to system npm only when VP_CONNECT_NODE was
   // set (i.e. the user opted out of vendoring).
+  //
+  // We wipe node_modules/ + package-lock.json first so a previous failed
+  // install can't leave stale or partially-resolved trees behind. Cheap
+  // hygiene; the working set is only ~3 MB.
   const pkg = require('../package.json') || {};
   const deps = pkg.dependencies || {};
+  try { fs.rmSync(path.join(INSTALL_DIR, 'node_modules'),       { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(path.join(INSTALL_DIR, 'package-lock.json'),  { force: true }); } catch {}
   fs.writeFileSync(
     path.join(INSTALL_DIR, 'package.json'),
     JSON.stringify({
@@ -1253,7 +1297,14 @@ async function install() {
     // we don't surface this now the user's first dictation will silently
     // fail with no hint about why. We guide them with a dialog + auto-
     // opened Accessibility pane + Finder reveal of the node binary.
-    const probe = testAccessibility();
+    //
+    // Critical: probe via the *vendored* node (the binary that will
+    // actually run the LaunchAgent), not the installer's process node.
+    // TCC binds permission to the calling binary's signature; a probe
+    // via the wrong node tells us nothing about the service's eventual
+    // permission state. This also surfaces re-grant requirements after
+    // a NODE_VERSION bump where the new binary has a fresh cdhash.
+    const probe = probeAccessibilityViaNode(nodeBin);
     if (!probe.ok && probe.reason === 'accessibility') {
       console.log('\n  ⚠  macOS needs one more permission: Accessibility.\n');
       console.log('  vp-connect sends keystrokes (Cmd+V to paste what you dictate)');
@@ -1363,15 +1414,19 @@ function verify() {
   }
 
   // The LaunchAgent runs under the *vendored* node (~/.vp-connect/runtime/…),
-  // not whichever node is on the user's PATH right now. Point them at that
-  // binary specifically — granting Accessibility to a different node won't
-  // help the service.
+  // not whichever node is on the user's PATH right now. Probe through that
+  // binary so the answer is authoritative for the actual service. Granting
+  // Accessibility to any other node won't help.
   const vendoredNode = runtime.runtimeNodePath();
-  const targetNode = fs.existsSync(vendoredNode) ? vendoredNode : process.execPath;
+  const haveVendored = fs.existsSync(vendoredNode);
+  const targetNode   = haveVendored ? vendoredNode : process.execPath;
 
-  const probe = testAccessibility();
+  const probe = haveVendored
+    ? probeAccessibilityViaNode(vendoredNode)
+    : testAccessibility();
   if (probe.ok) {
     console.log('  ✓ Accessibility permission granted — paste will work');
+    console.log(`    (probed via ${haveVendored ? 'vendored node' : 'installer node'}: ${targetNode})`);
     console.log('');
     return;
   }

@@ -81,6 +81,20 @@ npx vp-connect --uninstall && npx vp-connect@latest --install
 
 This wipes the old install, downloads the vendored runtime, rewrites the LaunchAgent plist to point at it, and prints a fresh QR. Your phone pairing survives.
 
+### Install fails behind a corporate proxy (TLS / cert errors)
+
+If `npx vp-connect --install` errors with `CERT_HAS_EXPIRED`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, or `SELF_SIGNED_CERT_IN_CHAIN`, you're likely behind a corporate proxy that rewrites HTTPS with its own root CA. vp-connect's runtime download doesn't speak the HTTP CONNECT proxy protocol. Fastest fix: skip the download and reuse a node you already trust:
+
+```bash
+VP_CONNECT_NODE="$(command -v node)" npx vp-connect --install
+```
+
+The LaunchAgent / Scheduled Task will be wired to that node instead of a vendored copy. Caveat: if that node later moves, you'll need to re-run `--install`.
+
+### Windows: install fails or `node.exe` disappears after extraction
+
+Some antivirus products (Defender heuristics, Avast, AVG) briefly quarantine freshly-downloaded executables. If the install reports successful extraction but then can't find `node.exe`, check your AV's quarantine. The downloaded tarball is verified against the official nodejs.org SHA256 before extraction, so anything you see in quarantine is a false positive.
+
 ## How it works
 
 `vp-connect` opens a TCP socket on port `38555`. The Vibephone iOS app connects over your local Wi-Fi and sends newline-delimited JSON. On connect the app sends a `hello` (wire protocol + app version); the server replies with `helloAck` including the running **vp-connect** semver so the phone can prompt you to upgrade if the Mac is behind.
@@ -111,6 +125,12 @@ falls back to a JXA helper script automatically. Same behavior, slightly
 higher latency on pointer drags. See `vendor/macos/README.md` for build
 details.
 
+## Security notes
+
+- **Vendored Node runtime is verified.** The Node binary downloaded into `~/.vp-connect/runtime/` is checked against a hardcoded SHA256 from nodejs.org's official `SHASUMS256.txt` before extraction. A mismatch aborts the install — vp-connect will never run an unverified binary.
+- **Accessibility permission is binary-bound, not script-bound.** Once you grant Accessibility to `~/.vp-connect/runtime/.../bin/node`, anything that exec's that exact binary inherits the permission. This is inherent to macOS TCC and applies equally to granting Accessibility to system `node` (e.g. `/usr/local/bin/node`). Don't run untrusted scripts through the vendored binary.
+- **Bumping the Node pin may require a re-grant.** When vp-connect bumps `NODE_VERSION`, the new binary has a fresh code-signing identity from TCC's perspective. The installer re-probes Accessibility automatically and shows the System Settings pane if a re-grant is needed.
+
 ## Tuning
 
 | Env var | Default | Effect |
@@ -122,4 +142,4 @@ details.
 
 To override on the LaunchAgent, edit `~/Library/LaunchAgents/com.vibephone.vp-connect.plist`, add the env var inside the existing `EnvironmentVariables` dict, then `launchctl unload && launchctl load` it.
 
-No Python, no dependencies — just Node.js built-ins.
+Pure JavaScript runtime (no Python, no native compile step). The vendored Node binary is verified against the official nodejs.org SHA256 before extraction.

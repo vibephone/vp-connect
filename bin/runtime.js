@@ -11,8 +11,9 @@
 //     drop their own `node` ahead of brew / nvm in PATH. If `npx
 //     vp-connect --install` runs while one of those is active,
 //     `process.execPath` resolves to the agent's node — and that exact
-//     path gets baked into the plist. When the agent later updates,
-//     uninstalls, or swaps versions, the LaunchAgent silently 5xx's.
+//     path gets baked into the plist / scheduled task. When the agent
+//     later updates, uninstalls, or swaps versions, the service silently
+//     5xx's.
 //
 //   • Version managers (nvm, asdf, fnm) similarly rebind `node` between
 //     sessions, with the same failure mode.
@@ -23,20 +24,57 @@
 //
 // Escape hatch: set VP_CONNECT_NODE=/path/to/node to skip the download
 // and use a node binary you already trust. Useful for CI, sandboxed
-// builds, or air-gapped hosts.
+// builds, air-gapped hosts, or corporate proxies that intercept HTTPS
+// (we don't speak the HTTP CONNECT proxy protocol — Node's stdlib
+// doesn't include a proxy agent).
 
-const fs    = require('fs');
-const path  = require('path');
-const os    = require('os');
-const cp    = require('child_process');
-const https = require('https');
+const fs     = require('fs');
+const path   = require('path');
+const os     = require('os');
+const cp     = require('child_process');
+const https  = require('https');
+const crypto = require('crypto');
 
-// Pinned LTS. Bumping this schedules a one-time ~46 MB re-download for
-// every existing install (next time they run --install). Pick a Node
-// release that's been LTS for >=3 months to avoid trailing platform
-// support gaps (Apple Silicon binaries arrived in v16, Linux arm64
-// in v14, Windows arm64 in v20).
+// ── Pinned Node version + verified hashes ────────────────────────────────────
+//
+// Bumping NODE_VERSION is a small ritual (4 steps):
+//   1. Update NODE_VERSION below to the next LTS tag.
+//   2. Replace ASSET_SHA256 from the new release's SHASUMS256.txt:
+//        https://nodejs.org/dist/<version>/SHASUMS256.txt
+//      Keep only the rows matching the assets we actually download
+//      (darwin-arm64.tar.gz, darwin-x64.tar.gz, linux-arm64.tar.xz,
+//      linux-x64.tar.xz, win-arm64.zip, win-x64.zip).
+//   3. Run a real --install on macOS + Windows to confirm extraction
+//      works and the post-install Accessibility re-probe surfaces.
+//   4. Existing users auto-upgrade on next `npx vp-connect --install`,
+//      and the prior runtime is swept by cleanStaleRuntimes.
+//
+// Keep this on a current LTS release. Node v22 is LTS through April
+// 2027; schedule a bump to the next LTS (likely v24) by early 2027 to
+// stay inside the upstream security-update window. After that date,
+// vendored binaries get no security backports — strictly worse than
+// using the user's `node`.
+
 const NODE_VERSION = 'v22.11.0';
+
+// SHA256 of each tarball/zip we may download. Verified after download
+// and before extraction. Defends against:
+//   • CDN compromise (CloudFront cache poisoning, etc.)
+//   • MitM proxies with a corporate root CA in the trust store
+//   • Corrupted partial downloads (mismatched sizes wouldn't be caught
+//     by HTTP alone if the server omits Content-Length)
+// Sourced from https://nodejs.org/dist/<version>/SHASUMS256.txt — that
+// file is also PGP-signed by a Node release captain, but we don't
+// currently chain to that signature (would require shipping GPG +
+// Node-foundation public keys).
+const ASSET_SHA256 = {
+  'node-v22.11.0-darwin-arm64.tar.gz': '2e89afe6f4e3aa6c7e21c560d8a0453d84807e97850bbb819b998531a22bdfde',
+  'node-v22.11.0-darwin-x64.tar.gz':   '668d30b9512137b5f5baeef6c1bb4c46efff9a761ba990a034fb6b28b9da2465',
+  'node-v22.11.0-linux-arm64.tar.xz':  '6031d04b98f59ff0f7cb98566f65b115ecd893d3b7870821171708cdbaf7ae6e',
+  'node-v22.11.0-linux-x64.tar.xz':    '83bf07dd343002a26211cf1fcd46a9d9534219aad42ee02847816940bf610a72',
+  'node-v22.11.0-win-arm64.zip':       'b9ff5a6b6ffb68a0ffec82cc5664ed48247dabbd25ee6d129facd2f65a8ca80d',
+  'node-v22.11.0-win-x64.zip':         '905373a059aecaf7f48c1ce10ffbd5334457ca00f678747f19db5ea7d256c236',
+};
 
 const MAC   = process.platform === 'darwin';
 const WIN   = process.platform === 'win32';
@@ -47,6 +85,13 @@ const INSTALL_DIR = MAC
   : path.join(process.env.APPDATA || os.homedir(), 'vp-connect');
 
 const RUNTIME_DIR = path.join(INSTALL_DIR, 'runtime');
+
+// Headroom for the download (compressed tarball + extracted tree +
+// scratch). Empirically a v22.x macOS extracted runtime is ~110 MB and
+// the .tar.gz another ~46 MB; rounded up to 200 MB for slack. We do a
+// best-effort statfs check before downloading so users on a near-full
+// disk get a clear error up front rather than a half-extracted tree.
+const REQUIRED_BYTES = 200 * 1024 * 1024;
 
 // ── Platform asset map ───────────────────────────────────────────────────────
 
@@ -114,7 +159,9 @@ function isReady(p) {
  *
  *  We match strictly on the `node-v<digits>` prefix so user-created
  *  scratch dirs (or future non-runtime artefacts under runtime/) are
- *  never touched. */
+ *  never touched. The path-containment guarantee is doubled by using
+ *  `path.join(RUNTIME_DIR, entry)` — `fs.rmSync` cannot escape
+ *  RUNTIME_DIR no matter what `entry` contains. */
 function cleanStaleRuntimes(currentFolder, logger) {
   let entries;
   try {
@@ -133,6 +180,65 @@ function cleanStaleRuntimes(currentFolder, logger) {
       logger.log(`  i  Could not remove ${entry}: ${e.message}`);
     }
   }
+}
+
+// ── Pre-flight checks ────────────────────────────────────────────────────────
+
+/** Best-effort disk-space check before downloading. Throws if we can
+ *  prove there's not enough room; silently passes if we can't query
+ *  (older Node, unsupported FS, permission errors, …). */
+function checkDiskSpace(dir, logger) {
+  if (typeof fs.statfsSync !== 'function') {
+    return; // Node <18.15 — skip silently.
+  }
+  let free;
+  try {
+    const s = fs.statfsSync(dir);
+    free = Number(s.bsize) * Number(s.bavail);
+  } catch {
+    return; // Filesystem doesn't support statfs — skip.
+  }
+  if (free < REQUIRED_BYTES) {
+    throw new Error(
+      `Not enough disk space at ${dir}: ` +
+      `have ${(free / 1e6).toFixed(0)} MB, need ~${(REQUIRED_BYTES / 1e6).toFixed(0)} MB.\n` +
+      `Free up some space and re-run npx vp-connect --install.`
+    );
+  }
+}
+
+/** Mark RUNTIME_DIR as backup-excluded on macOS so 100 MB of vendored
+ *  Node binaries don't bloat every Time Machine snapshot or sit
+ *  permanently in the Spotlight index. Both calls are best-effort:
+ *    • `.metadata_never_index` is honoured by Spotlight per-folder.
+ *    • `tmutil addexclusion` excludes from Time Machine backups.
+ *  Failures are non-fatal — the install still succeeds, the user just
+ *  ends up with backups they didn't strictly need.
+ *
+ *  Windows File History / Search Indexer have no clean per-folder
+ *  programmatic equivalents worth wiring up; this is a Mac-only
+ *  optimization. */
+function excludeFromBackups(logger) {
+  if (!MAC) return;
+
+  // Idempotency sentinel — once we've successfully tagged the dir
+  // there's no value in re-running tmutil on every install (a single
+  // call on an unusual FS can take a couple of seconds).
+  const marker = path.join(RUNTIME_DIR, '.vp-backup-excluded');
+  if (fs.existsSync(marker)) return;
+
+  try {
+    fs.writeFileSync(path.join(RUNTIME_DIR, '.metadata_never_index'), '');
+  } catch {}
+  try {
+    cp.execFileSync('tmutil', ['addexclusion', RUNTIME_DIR], {
+      stdio: 'pipe',
+      timeout: 2_000,
+    });
+  } catch {}
+  try {
+    fs.writeFileSync(marker, '');
+  } catch {}
 }
 
 // ── HTTPS download with progress + redirect follow ───────────────────────────
@@ -184,8 +290,65 @@ function download(url, dest, hops = 0) {
       });
     });
     req.on('timeout', () => req.destroy(new Error('Download timed out (120s)')));
-    req.on('error', reject);
+    req.on('error', (err) => {
+      f.close();
+      try { fs.unlinkSync(dest); } catch {}
+      // Surface the most common networking gotcha clearly.
+      if (err.code === 'CERT_HAS_EXPIRED' || err.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+          || err.code === 'SELF_SIGNED_CERT_IN_CHAIN') {
+        reject(new Error(
+          `TLS error fetching Node runtime: ${err.code}.\n` +
+          `If you're behind a corporate proxy that rewrites HTTPS, set\n` +
+          `  VP_CONNECT_NODE=/path/to/your/node\n` +
+          `to skip the download and reuse a node you already trust.`
+        ));
+      } else {
+        reject(err);
+      }
+    });
   });
+}
+
+// ── Verification ─────────────────────────────────────────────────────────────
+
+/** Compute SHA256 of `file` as lowercase hex. */
+function sha256(file) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    const s = fs.createReadStream(file);
+    s.on('data', (c) => h.update(c));
+    s.on('end',  () => resolve(h.digest('hex')));
+    s.on('error', reject);
+  });
+}
+
+/** Throws if the downloaded file's hash doesn't match the pinned one. */
+async function verifyChecksum(p, logger) {
+  const expected = ASSET_SHA256[p.asset.file];
+  if (!expected) {
+    throw new Error(
+      `No SHA256 hash recorded for ${p.asset.file}. This is a packaging bug — ` +
+      `please file an issue with your platform (${process.platform}/${process.arch}).`
+    );
+  }
+  logger.log(`  ⊙ Verifying SHA256…`);
+  const actual = await sha256(p.archive);
+  if (actual !== expected) {
+    try { fs.unlinkSync(p.archive); } catch {}
+    throw new Error(
+      `Checksum mismatch on downloaded Node runtime!\n` +
+      `  asset    : ${p.asset.file}\n` +
+      `  expected : ${expected}\n` +
+      `  actual   : ${actual}\n` +
+      `Refusing to extract a tampered binary. Possible causes:\n` +
+      `  • Network corruption — retry the install.\n` +
+      `  • Corporate proxy rewriting HTTPS payloads.\n` +
+      `  • CDN compromise (rare but real).\n` +
+      `If you trust your environment, override with:\n` +
+      `  VP_CONNECT_NODE=/path/to/node npx vp-connect --install`
+    );
+  }
+  logger.log(`  ✓ SHA256 matches  (${expected.slice(0, 12)}…)`);
 }
 
 // ── Extraction ───────────────────────────────────────────────────────────────
@@ -194,7 +357,11 @@ function download(url, dest, hops = 0) {
  *    • macOS: BSD tar — handles .tar.gz and .tar.xz natively.
  *    • Linux: GNU tar — same.
  *    • Windows 10+ (1803): bsdtar via libarchive — handles .zip too.
- *  Node engines >=18 implies all three OSes are recent enough. */
+ *  Node engines >=18 implies all three OSes are recent enough.
+ *
+ *  Path-traversal / symlink attacks in the tarball are subsumed by the
+ *  SHA256 check above — we only ever extract bytes that match a hash
+ *  we hardcoded against an upstream SHASUMS256.txt. */
 function extract(archivePath) {
   cp.execFileSync('tar', ['-xf', archivePath, '-C', RUNTIME_DIR], {
     stdio: ['ignore', 'inherit', 'inherit'],
@@ -221,6 +388,8 @@ async function ensureRuntime({ logger = console } = {}) {
   }
 
   fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  excludeFromBackups(logger); // Idempotent — safe to redo on every install.
+
   const p = paths();
 
   if (isReady(p)) {
@@ -230,6 +399,9 @@ async function ensureRuntime({ logger = console } = {}) {
     cleanStaleRuntimes(p.folder, logger);
     return { nodeBin: p.nodeBin, npmCli: p.npmCli, vendored: true };
   }
+
+  // Surface disk-space problems before we start a 45 MB download.
+  checkDiskSpace(RUNTIME_DIR, logger);
 
   // Clear out any partial state from a previous failed install of THIS
   // version. We deliberately leave older versions in place here — if the
@@ -244,6 +416,8 @@ async function ensureRuntime({ logger = console } = {}) {
   logger.log(`  ↓ Fetching Node ${NODE_VERSION}  (one-time, ~45 MB)`);
   logger.log(`    ${url}`);
   await download(url, p.archive);
+
+  await verifyChecksum(p, logger);
 
   logger.log(`  ⇡ Extracting…`);
   extract(p.archive);
