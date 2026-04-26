@@ -103,6 +103,38 @@ function isReady(p) {
   }
 }
 
+/** Remove any sibling `node-vX.Y.Z-<plat>-<arch>` directories under
+ *  RUNTIME_DIR that aren't the current target. Run after we've confirmed
+ *  the current target is good, so a botched upgrade can never leave the
+ *  user with no runtime at all.
+ *
+ *  Without this, every `NODE_VERSION` bump would leave the previous
+ *  ~100 MB extracted tree behind forever — disk usage grows monotonically
+ *  with each vp-connect Node-pin upgrade.
+ *
+ *  We match strictly on the `node-v<digits>` prefix so user-created
+ *  scratch dirs (or future non-runtime artefacts under runtime/) are
+ *  never touched. */
+function cleanStaleRuntimes(currentFolder, logger) {
+  let entries;
+  try {
+    entries = fs.readdirSync(RUNTIME_DIR);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry === currentFolder) continue;
+    if (!/^node-v\d+\.\d+\.\d+-/.test(entry)) continue;
+    const stale = path.join(RUNTIME_DIR, entry);
+    try {
+      fs.rmSync(stale, { recursive: true, force: true });
+      logger.log(`  ⌫ Removed older Node runtime: ${entry}`);
+    } catch (e) {
+      logger.log(`  i  Could not remove ${entry}: ${e.message}`);
+    }
+  }
+}
+
 // ── HTTPS download with progress + redirect follow ───────────────────────────
 
 function download(url, dest, hops = 0) {
@@ -193,10 +225,17 @@ async function ensureRuntime({ logger = console } = {}) {
 
   if (isReady(p)) {
     logger.log(`  ✓ Vendored Node ${NODE_VERSION} already present (${p.nodeBin})`);
+    // Sweep stale siblings on idempotent runs too, so anyone who upgraded
+    // from a pre-cleanup release gets their disk reclaimed automatically.
+    cleanStaleRuntimes(p.folder, logger);
     return { nodeBin: p.nodeBin, npmCli: p.npmCli, vendored: true };
   }
 
-  // Clear out any partial state from a previous failed install.
+  // Clear out any partial state from a previous failed install of THIS
+  // version. We deliberately leave older versions in place here — if the
+  // download below fails, the old runtime is the only thing keeping the
+  // user's service working, and we'd rather degrade gracefully than nuke
+  // it preemptively.
   try { fs.rmSync(p.root,    { recursive: true, force: true }); } catch {}
   try { fs.rmSync(p.archive, { force: true }); } catch {}
   try { fs.rmSync(p.versionMarker, { force: true }); } catch {}
@@ -216,6 +255,10 @@ async function ensureRuntime({ logger = console } = {}) {
   fs.writeFileSync(p.versionMarker, NODE_VERSION);
 
   logger.log(`  ✓ Vendored Node ${NODE_VERSION} ready  (${p.nodeBin})`);
+
+  // New runtime is verified working — now safe to evict the old one(s).
+  cleanStaleRuntimes(p.folder, logger);
+
   return { nodeBin: p.nodeBin, npmCli: p.npmCli, vendored: true };
 }
 
