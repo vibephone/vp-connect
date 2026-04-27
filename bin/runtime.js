@@ -420,8 +420,11 @@ async function ensureRuntime({ logger = console } = {}) {
   await verifyChecksum(p, logger);
 
   logger.log(`  ⇡ Extracting…`);
-  extract(p.archive);
-  try { fs.unlinkSync(p.archive); } catch {}
+  try {
+    extract(p.archive);
+  } finally {
+    try { fs.unlinkSync(p.archive); } catch {}
+  }
 
   if (!fs.existsSync(p.nodeBin)) {
     throw new Error(`Extraction completed but node binary not found at ${p.nodeBin}`);
